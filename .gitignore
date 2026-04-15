@@ -1,0 +1,8 @@
+# ROS 2 Bags
+*.db3
+*.mcap
+
+# Large Maps / Models (if you don't want them tracked)
+*.pgm
+*.pt
+ros2_datasets/
