@@ -42,27 +42,30 @@ This code serves as the perception foundation for advanced autonomous behaviors 
 
 **1. Standard ROS 2 Packages**
 Ensure you have ROS 2, Gazebo, and the TurtleBot3 packages installed.
-```
+```bash
 sudo apt install ros-<distro>-turtlebot3-gazebo ros-<distro>-turtlebot3-teleop
 ```
 **2. Python Dependencies**
 Install the Ultralytics YOLO library and the `lapx` math library (required for ByteTrack's internal calculations).
-
+```bash
 pip3 install ultralytics
 pip3 install lapx
-
+```
 **How to Run the Simulation**
 You will need three separate terminals to run the simulation, teleop, and the AI node.
 
 **Terminal 1: Launch the Simulator**
 Important: You must use the "waffle" model! The default "burger" model does not have a camera, which will prevent the script from running.
+```bash
 export TURTLEBOT3_MODEL=waffle
 ros2 launch turtlebot3_gazebo turtlebot3_house.launch.py
-
+```
 **Terminal 2: Launch the Steering Wheel (Teleop)**
+```bash
 export TURTLEBOT3_MODEL=waffle
 ros2 run turtlebot3_teleop teleop_keyboard
-
+```
 **Terminal 3: Launch the Spatial AI Node**
+```bash
 cd ~/ros2_ws/src/r_one/FakeSceneUnderstanding
 python3 real_ai.py
