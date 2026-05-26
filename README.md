@@ -43,7 +43,7 @@ This code serves as the perception foundation for advanced autonomous behaviors 
 **1. Standard ROS 2 Packages**
 Ensure you have ROS 2, Gazebo, and the TurtleBot3 packages installed.
 ```bash
-sudo apt install ros-<distro>-turtlebot3-gazebo ros-<distro>-turtlebot3-teleop
+sudo apt install ros-humble-turtlebot3-gazebo ros-humble-turtlebot3-teleop
 ```
 **2. Python Dependencies**
 Install the Ultralytics YOLO library and the `lapx` math library (required for ByteTrack's internal calculations).
