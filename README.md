@@ -69,3 +69,9 @@ ros2 run turtlebot3_teleop teleop_keyboard
 ```bash
 cd ~/ros2_ws/src/r_one/FakeSceneUnderstanding
 python3 real_ai.py
+```
+**Terminal 4: Launch the spatial awareness Node**
+```bash
+cd ~/ros2_ws/src/r_one/FakeSceneUnderstanding
+python3 situational_awareness.py
+```
