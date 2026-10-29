@@ -34,7 +34,7 @@ This code serves as the perception foundation for advanced autonomous behaviors 
 ### 4. Object Permanence & The "World Model"
 **The Concept:** The robot must remember where things are, even when it looks away.
 **How it Works:** If an object's speed is greater than 0.15 m/s, it is tagged `[DYNAMIC]`. Otherwise, it is `[STATIC]`. All `[STATIC]` objects are saved to a global `world_model` dictionary.
-**Result:** The robot maintains a persistent map of the furniture and environment, achieving true object permanence without the massive compute load of heavy 3D voxel mapping software.
+**Result:** The robot maintains a persistent map of the environment, achieving true object permanence without the massive compute load of heavy 3D voxel mapping software.
 
 ---
 
