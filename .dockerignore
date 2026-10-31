@@ -1,0 +1,13 @@
+.git
+.gitignore
+.dockerignore
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints
+.gemini/
+
