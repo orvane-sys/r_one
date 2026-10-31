@@ -1,77 +1,395 @@
-# ROS 2 Spatial Scene Understanding (PSM_015)
+# ROS 2 Spatial Scene Understanding (`r_one`)
 
-## Introduction: What Does This Repository Do?
-This repository transforms a robot's basic 2D camera feed into a fully functional **3D Spatial AI and World Model**. 
+[![ROS 2](https://img.shields.io/badge/ROS%202-Humble%20%7C%20Iron%20%7C%20Jazzy-blue.svg)](https://docs.ros.org/)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20LTS-E95420.svg)](https://ubuntu.com/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](docker-compose.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE.md)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-Out of the box, robots can "see" pixels using a camera and "feel" distances using LiDAR, but these two data streams are entirely separate. This project bridges that gap. By mathematically fusing **YOLOv8 Object Detection** with **2D LiDAR Laser Scans**, this repository enables a ROS 2 robot to:
-1. **Identify** objects in its environment (e.g., people, tables, chairs).
-2. **Locate** them in physical 3D space with precise Metric Coordinates (X and Y distances).
-3. **Track** multiple targets simultaneously using unique IDs to avoid "amnesia" between frames.
-4. **Calculate** real-time kinematics (speed and velocity in m/s) of moving targets.
-5. **Remember** the environment by building a persistent "World Model" that stores the locations of static objects even when the robot turns its head away.
+A real-time 3D spatial perception, multi-target tracking, and persistent world-modeling system for ROS 2 mobile robots.
 
-This code serves as the perception foundation for advanced autonomous behaviors like threat assessment, dynamic obstacle avoidance, and human-following.
+By mathematically fusing **YOLOv8 2D vision** with **2D LiDAR scans**, synchronized via `message_filters` and transformed into fixed world coordinates (`odom` / `map`) through **TF2**, `r_one` enables robots to detect, identify, track kinematics, and build true object permanence with zero spatial coordinate drift.
 
 ---
 
-## Key Features & Objectives Achieved
+## Architecture Pipeline
 
-### 1. LiDAR-Camera Data Fusion (HUMANOID_PSM_011)
-**The Concept:** 2D cameras lack depth, and LiDAR lacks object classification. We fused them.
-**How it Works:** The node subscribes to `/camera/camera_info` to get the focal length and optical center. When YOLO detects a bounding box, it calculates the horizontal angle of the object and looks up that exact angle in the `/scan` LiDAR array.
-**Result:** Real-world Metric Coordinates (Forward X, Lateral Y) for every recognized object.
+```mermaid
+flowchart TD
+    subgraph Inputs ["Sensor Inputs"]
+        CAM["/camera/image_raw<br/>(sensor_msgs/Image)"]
+        INFO["/camera/camera_info<br/>(sensor_msgs/CameraInfo)"]
+        SCAN["/scan<br/>(sensor_msgs/LaserScan)"]
+        TF["/tf & /tf_static<br/>(tf2_msgs/TFMessage)"]
+    end
 
-### 2. Multi-Target Tracking & Unique IDs
-**The Concept:** The robot needs to know if the cup it sees now is the same cup it saw 5 frames ago.
-**How it Works:** Integrated **ByteTrack** (via Ultralytics) to assign persistent Unique integer IDs to objects across frames. 
-**Result:** Solves the "amnesia/flickering" problem. Objects are reliably tracked as `[ID: 1]`, `[ID: 2]`, etc.
+    subgraph Perception ["Core Spatial Perception Node"]
+        SYNC["message_filters.ApproximateTimeSynchronizer<br/>(80ms window tolerance)"]
+        YOLO["YOLOv8 + ByteTrack<br/>(2D BBoxes + Unique IDs)"]
+        GEOM["Azimuth Geometry & 5-Beam Median Filter<br/>(Angle -> Depth Matching)"]
+        TRANS["TF2 Transform: laser_frame -> odom<br/>(Drift-Free Global Projection)"]
+        KIN["Global Kinematics & Speed Estimator<br/>(v = dr / dt in odom frame)"]
+        WM["Persistent World Model Memory<br/>(Object Permanence)"]
+    end
 
-### 3. Kinematics (Velocity Vectors)
-**The Concept:** Calculating how fast objects are moving in the world.
-**How it Works:** Built a short-term memory buffer (`self.object_history`) that logs the X, Y coordinates and the timestamp of each object. Uses standard physics (v = d/t) and the Pythagorean theorem to calculate distance moved between frames.
-**Result:** Real-time speed output in meters per second (m/s).
+    subgraph Outputs ["Visualization & Control"]
+        RVIZ["/perception/markers<br/>(visualization_msgs/MarkerArray)"]
+        AEB["/cmd_vel_fusion<br/>(Active Emergency Braking)"]
+        ALERTS["/robot_alerts<br/>(Safety Zone Warnings)"]
+    end
 
-### 4. Object Permanence & The "World Model"
-**The Concept:** The robot must remember where things are, even when it looks away.
-**How it Works:** If an object's speed is greater than 0.15 m/s, it is tagged `[DYNAMIC]`. Otherwise, it is `[STATIC]`. All `[STATIC]` objects are saved to a global `world_model` dictionary.
-**Result:** The robot maintains a persistent map of the environment, achieving true object permanence without the massive compute load of heavy 3D voxel mapping software.
+    CAM --> SYNC
+    SCAN --> SYNC
+    INFO -.->|Camera Intrinsics fx, cx| GEOM
+    SYNC --> YOLO
+    YOLO --> GEOM
+    GEOM --> TRANS
+    TF --> TRANS
+    TRANS --> KIN
+    KIN --> WM
+    KIN --> RVIZ
+    WM --> RVIZ
+    SCAN --> AEB
+    SCAN --> ALERTS
+```
 
 ---
 
-## Installation & Prerequisites
+## Key Capabilities
 
-**1. Standard ROS 2 Packages**
-Ensure you have ROS 2, Gazebo, and the TurtleBot3 packages installed.
-```bash
-sudo apt install ros-humble-turtlebot3-gazebo ros-humble-turtlebot3-teleop
-```
-**2. Python Dependencies**
-Install the Ultralytics YOLO library and the `lapx` math library (required for ByteTrack's internal calculations).
-```bash
-pip3 install ultralytics
-pip3 install lapx
-```
-**How to Run the Simulation**
-You will need three separate terminals to run the simulation, teleop, and the AI node.
+1. **Approximate Time Sensor Synchronization:** Synchronizes `/camera/image_raw` and `/scan` using `message_filters.ApproximateTimeSynchronizer` (slop: 80ms) and applies a 5-beam median filter to eliminate laser noise, dropout rays, and coordinate skew.
+2. **Drift-Free Global Coordinates (TF2):** Directly projects detected objects into the global odometry frame (`odom` or `map`). As the robot drives or rotates, stored static objects in `world_model` remain fixed in room coordinates.
+3. **True Metric Kinematics & Velocity Projection:** Computes object velocity vectors $(\Delta x / \Delta t, \Delta y / \Delta t)$ in the fixed world frame. Projects future obstacle footprints ($t = 0.5\text{s} \dots 2.0\text{s}$) as a standard `sensor_msgs/msg/PointCloud2` into Nav2's local costmap so autonomous planners proactively route around walking pedestrians.
+4. **Interactive 3D RViz2 Displays:** Publishes standard `visualization_msgs/msg/MarkerArray` to `/perception/markers`:
+   - **3D Bounding Cubes**: Color-coded green (`STATIC`) and orange (`DYNAMIC`).
+   - **Floating HUD Text**: Real-time object class, tracking ID, distance, and metric speed in m/s.
+   - **Velocity Vectors & Trajectory Paths**: Directional 3D arrows and lookahead line strips indicating moving target trajectories.
+   - **Memory Cylinders**: Visualizes remembered static objects even when outside the camera field of view.
+5. **Zero-Simulation Bag Evaluation:** Fully decoupled playback mode allows running and evaluating the entire perception pipeline and RViz visualizer from pre-recorded `.mcap` bags on any laptop without installing Gazebo or spinning up physics simulation.
 
-**Terminal 1: Launch the Simulator**
-Important: You must use the "waffle" model! The default "burger" model does not have a camera, which will prevent the script from running.
+---
+
+## Quickstart in 60 Seconds
+
+### Option 1: Run with Docker Compose (Zero Setup)
+
+Prerequisites: Install [Docker](https://docs.docker.com/engine/install/) and [Docker Compose](https://docs.docker.com/compose/install/).
+
 ```bash
-export TURTLEBOT3_MODEL=waffle
-ros2 launch turtlebot3_gazebo turtlebot3_house.launch.py
+# Allow local container to access X11 graphical display
+xhost +local:root
+
+# Clone and launch simulation, spatial perception, and RViz
+docker compose up
 ```
-**Terminal 2: Launch the Steering Wheel (Teleop)**
+
+> **Note:** If you are running on a machine without an NVIDIA GPU, Docker will automatically fall back to software OpenGL rendering (Mesa LLVMpipe).
+
+---
+
+### Option 2: Native ROS 2 Installation
+
+#### 1. System Dependencies
 ```bash
-export TURTLEBOT3_MODEL=waffle
-ros2 run turtlebot3_teleop teleop_keyboard
+sudo apt update
+sudo apt install -y \
+  ros-humble-turtlebot3-gazebo \
+  ros-humble-turtlebot3-teleop \
+  ros-humble-tf2-geometry-msgs \
+  ros-humble-message-filters \
+  ros-humble-visualization-msgs \
+  ros-humble-vision-msgs \
+  ros-humble-diagnostic-msgs \
+  ros-humble-ament-cmake-python \
+  ros-humble-ros2-control \
+  ros-humble-ros2-controllers \
+  ros-humble-xacro
 ```
-**Terminal 3: Launch the Spatial AI Node**
+
+#### 2. Python Dependencies
+> [!IMPORTANT]
+> OpenCV and `cv_bridge` in ROS 2 Humble require `numpy<2`. Pin NumPy to version 1.x:
 ```bash
-cd ~/ros2_ws/src/r_one/FakeSceneUnderstanding
-python3 real_ai.py
+pip3 install "numpy<2" ultralytics lapx
 ```
-**Terminal 4: Launch the spatial awareness Node**
+
+#### 3. Build Workspace
 ```bash
-cd ~/ros2_ws/src/r_one/FakeSceneUnderstanding
-python3 situational_awareness.py
+cd ~/ros2_ws
+colcon build --symlink-install --packages-select r_one
+source install/setup.bash
 ```
+
+---
+
+## Running the System
+
+### Single-Command Unified Launch (Recommended)
+
+Starts Gazebo simulation, spawns the robot with differential drive controllers, boots the spatial perception node, and opens RViz2 with pre-configured 3D perception displays:
+
+```bash
+ros2 launch r_one spatial_scene.launch.py
+```
+
+#### Common Launch Arguments
+
+| Argument | Default | Description | Example |
+|---|---|---|---|
+| `sim` | `true` | Launch Gazebo simulator and robot spawner | `sim:=false` (runs on physical robot) |
+| `rviz` | `true` | Launch RViz2 visualizer | `rviz:=false` (headless mode) |
+| `world` | `worlds/spatial_demo.world` | Gazebo world file (features walking human actor) | `world:=worlds/empty.world` |
+| `target_frame` | `odom` | Reference frame for world coordinates | `target_frame:=map` (with SLAM/Nav2) |
+| `depth_source` | `lidar` | Depth sensor backend: `'lidar'` or `'depth_image'` | `depth_source:=depth_image` |
+| `depth_topic` | `/camera/depth/image_raw` | Depth image topic when depth_source is depth_image | `depth_topic:=/camera/depth/image_raw` |
+| `speed_threshold` | `0.15` | Velocity threshold (m/s) for dynamic objects | `speed_threshold:=0.25` |
+| `show_camera_window` | `false` | Open separate OpenCV 2D detection window | `show_camera_window:=true` |
+
+*Example: Headless perception on real hardware:*
+```bash
+ros2 launch r_one spatial_scene.launch.py sim:=false rviz:=false target_frame:=odom
+```
+
+---
+
+### Zero-Simulation Evaluation (Rosbag Mode)
+
+Test the 3D perception pipeline instantly without Gazebo or robot hardware:
+
+```bash
+# 1. Download sample demonstration bag (or record locally via ./scripts/record_sample_bag.sh)
+./scripts/download_sample_bag.sh
+
+# 2. Launch perception and RViz with clock-synchronized bag playback
+ros2 launch r_one spatial_bag_playback.launch.py bag_path:=sample_bags/sample_spatial_run.mcap
+```
+
+---
+
+### Option B: Individual Node CLI (`ros2 run`)
+
+Nodes can also be executed individually via standard ROS 2 entry points:
+
+```bash
+# Spatial 3D Perception & World Model Node
+ros2 run r_one spatial_vision_node
+
+# Situational Awareness / Perimeter Warning Node
+ros2 run r_one situational_awareness_node
+
+# Active Emergency Braking (AEB) / Sensor Fusion Node
+ros2 run r_one sensor_fusion_node
+
+# Mock AI Publisher (for testing without GPU)
+ros2 run r_one mock_ai_node
+```
+
+#### Legacy Script Compatibility
+Direct execution via Python remains fully supported for backward compatibility:
+```bash
+cd ~/ros2_ws/src/r_one/FakeSceneUnderStanding
+python3 spatial_vision_node.py
+# or:
+python3 real_ai2.py
+```
+
+---
+
+## Node Parameters Reference
+
+### `spatial_vision_node`
+
+| Parameter | Type | Default | Dynamic? | Description |
+|---|---|---|---|---|
+| `target_frame` | `string` | `'odom'` | No | Fixed reference frame for global coordinate transforms and world model |
+| `depth_source` | `string` | `'lidar'` | No | Depth sensor source: `'lidar'` (2D scan) or `'depth_image'` (RGB-D pinhole projection) |
+| `depth_topic` | `string` | `'camera/depth/image_raw'` | No | Depth image topic when depth_source is depth_image |
+| `speed_threshold` | `double` | `0.15` | **Yes** | Minimum speed (m/s) to classify an object as `DYNAMIC` |
+| `ema_alpha` | `double` | `0.35` | **Yes** | Exponential Moving Average smoothing factor $\alpha \in (0.0, 1.0]$ for velocity estimation |
+| `tracking_filter` | `string` | `'ema'` | **Yes** | Kinematics tracking filter: `'ema'` (velocity smoothing) or `'kalman'` (2D state-space with occlusion coasting) |
+| `sync_slop` | `double` | `0.08` | **Yes** | Maximum allowable time delta (seconds) between camera and depth messages |
+| `process_every_n_frames` | `int` | `5` | **Yes** | Frame skip rate to minimize CPU/GPU load |
+| `show_debug_window` | `bool` | `false` | **Yes** | Displays OpenCV annotated 2D camera window |
+| `yolo_model` | `string` | `'yolov8n.pt'` | No | Ultralytics model weights |
+| `img_size` | `int` | `320` | No | Input resolution for YOLO inference |
+| `autostart` | `bool` | `true` | No | Automatically transitions LifecycleNode to active state on startup |
+
+---
+
+### Dynamic Parameter Reconfiguration
+
+Filter thresholds, frame skip ratios, and smoothing coefficients can be reconfigured live during runtime without restarting the node:
+
+```bash
+# Tune velocity classification threshold live (m/s)
+ros2 param set /spatial_vision speed_threshold 0.20
+
+# Adjust EMA velocity smoothing factor (0.0 < alpha <= 1.0)
+ros2 param set /spatial_vision ema_alpha 0.40
+
+# Adjust inference frequency (every N frames)
+ros2 param set /spatial_vision process_every_n_frames 3
+
+# Toggle OpenCV 2D debug window on or off
+ros2 param set /spatial_vision show_debug_window true
+```
+
+*All dynamic parameter inputs undergo bounds validation and reject invalid or out-of-range values.*
+
+---
+
+### Concurrency & Multi-Threaded Execution
+
+`SpatialVisionNode` is configured with `ReentrantCallbackGroup` and spins under a 4-thread `MultiThreadedExecutor`:
+- **Thread 1:** Sensor synchronization and camera image ingestion.
+- **Thread 2:** YOLOv8 neural network inference and ByteTrack data association.
+- **Thread 3:** TF2 coordinate transformation lookups and pinhole back-projection.
+- **Thread 4:** Publisher serialization (`PointCloud2`, `MarkerArray`, `Detection3DArray`, Diagnostics).
+
+This eliminates callback starvation during 30–45ms CPU inference bursts on multi-core processors.
+
+---
+
+### Real-Time Diagnostics & Telemetry (`/diagnostics`)
+
+`SpatialVisionNode` publishes diagnostic telemetry at 1.0 Hz using standard `diagnostic_msgs/msg/DiagnosticArray`:
+
+```bash
+ros2 topic echo /diagnostics
+```
+
+**Monitored Metrics:**
+- `fps`: Rolling perception frame processing rate.
+- `latency_ms`: Cycle time per inference and tracking step. Automatically elevates status to `WARN` if latency exceeds 100 ms ($<10$ FPS).
+- `active_tracks`: Count of currently tracked entities in ByteTrack memory.
+- `world_model_objects`: Count of static spatial entities retained in global coordinates.
+- `sync_delta_ms`: Real-time timestamp delta between RGB camera and depth sensor.
+
+---
+
+### Managed Lifecycle Architecture (`LifecycleNode`)
+
+`SpatialVisionNode` implements industrial-grade ROS 2 lifecycle state machine management (`rclpy.lifecycle.LifecycleNode`):
+- `on_configure`: Allocates message buffers, initializes TF listener, loads neural network weights, and configures QoS endpoints.
+- `on_activate`: Activates managed lifecycle publishers, starts the 1.0 Hz diagnostics telemetry timer, and enables the perception pipeline loop.
+- `on_deactivate`: Suspends processing loop, pauses publishers, and flushes transient predicted trajectory markers.
+- `on_cleanup`: Unloads neural network weights, wipes static world model caches, and flushes tracker history.
+- `on_shutdown`: Graceful destruction and socket teardown.
+
+> [!TIP]
+> **Zero-Friction Autostart:** Parameter `autostart: true` (default) automatically triggers `configure` and `activate` transitions upon boot. Everyday users launching `ros2 launch r_one spatial_scene.launch.py` require zero manual lifecycle commands, while industrial managers (Nav2 Lifecycle Manager or `ros2 lifecycle set ...`) retain full state-machine control when `autostart:=false`.
+
+```bash
+# Query current lifecycle state
+ros2 lifecycle get /spatial_vision
+
+# Manual state transitions (when autostart:=false or recovering from faults)
+ros2 lifecycle set /spatial_vision configure
+ros2 lifecycle set /spatial_vision activate
+ros2 lifecycle set /spatial_vision deactivate
+ros2 lifecycle set /spatial_vision cleanup
+```
+
+---
+
+### Operator Management Services (`std_srvs/srv/Trigger`)
+
+Exposes standard ROS 2 service servers for live memory and tracker management without restarting nodes:
+
+```bash
+# 1. Clear static world model and wipe RViz cylinder markers
+ros2 service call /spatial_vision/clear_world_model std_srvs/srv/Trigger
+
+# 2. Reset ByteTrack target IDs and kinematics buffers
+ros2 service call /spatial_vision/reset_tracker std_srvs/srv/Trigger
+```
+
+---
+
+### 2D Constant-Velocity Kalman Filter & Occlusion Coasting
+
+Along with EMA velocity smoothing, `SpatialVisionNode` supports a 2D state-space Kalman Filter ($\mathbf{x} = [x, y, v_x, v_y]^T$):
+- **Dynamic Activation:** Switch tracking filter on the fly via `ros2 param set /spatial_vision tracking_filter kalman`.
+- **Occlusion Coasting:** When a tracked obstacle (e.g. walking pedestrian) is temporarily occluded behind a narrow pillar for up to 3 frames ($0.24\text{ s}$), the Kalman filter predicts the object's forward trajectory and continues projecting safety footprints into Nav2 dynamic costmaps until detection is regained.
+
+---
+
+### Multi-Robot Scalability & Relative Namespacing
+
+All topics follow REP 103 / REP 105 relative namespace purity (no hardcoded leading `/`). Nodes can be placed inside robot namespaces for multi-robot fleets without topic collisions:
+
+```bash
+# Run isolated perception pipeline for robot_1
+ros2 run r_one spatial_vision_node --ros-args -r __ns:=/robot_1
+
+# Topics resolve cleanly to:
+#   /robot_1/camera/image_raw
+#   /robot_1/perception/markers
+#   /robot_1/perception/detections_3d
+#   /robot_1/perception/dynamic_costmap_obstacles
+```
+
+---
+
+## ROS 2 Topic & Service Interface
+
+### Topics
+
+| Topic | Type | Direction | QoS Profile | Description |
+|---|---|---|---|---|
+| `camera/image_raw` | `sensor_msgs/msg/Image` | Subscribed | Best Effort, Volatile, Depth=5 | Raw RGB camera stream |
+| `camera/camera_info` | `sensor_msgs/msg/CameraInfo` | Subscribed | Reliable, Volatile, Depth=10 | Optical focal length ($f_x, f_y$) & principal point ($c_x, c_y$) |
+| `scan` | `sensor_msgs/msg/LaserScan` | Subscribed | Best Effort, Volatile, Depth=5 | 2D LiDAR range scan (when `depth_source: lidar`) |
+| `camera/depth/image_raw` | `sensor_msgs/msg/Image` | Subscribed | Best Effort, Volatile, Depth=5 | Depth image stream (when `depth_source: depth_image`) |
+| `/tf`, `/tf_static` | `tf2_msgs/msg/TFMessage` | Subscribed | Dynamic | Dynamic and static coordinate transforms |
+| `perception/markers` | `visualization_msgs/msg/MarkerArray` | Published | Reliable, Volatile, Depth=10 | 3D bounding boxes, HUD text, velocity vectors, world model |
+| `perception/detections_3d` | `vision_msgs/msg/Detection3DArray` | Published | Reliable, Volatile, Depth=10 | Standard ROS 2 3D detections for Nav2 / autonomous planners |
+| `perception/dynamic_costmap_obstacles` | `sensor_msgs/msg/PointCloud2` | Published | Best Effort, Volatile, Depth=5 | Projected future obstacle footprint points for Nav2 dynamic costmap |
+| `/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | Published | Reliable, Volatile, Depth=10 | System health telemetry (FPS, cycle latency, active tracks) |
+| `robot_alerts` | `std_msgs/msg/String` | Published | Reliable, Volatile, Depth=10 | Safety zone warnings (`SAFE`, `CAUTION`, `STOP`) |
+| `cmd_vel_fusion` | `geometry_msgs/msg/Twist` | Published | Reliable, Volatile, Depth=10 | Active Emergency Braking velocity commands |
+
+### Services
+
+| Service | Type | Description |
+|---|---|---|
+| `~/clear_world_model` | `std_srvs/srv/Trigger` | Clears all cached static objects from world model memory and wipes RViz visual markers |
+| `~/reset_tracker` | `std_srvs/srv/Trigger` | Resets active ByteTrack IDs, kinematics history, and Kalman filter state |
+
+---
+
+## Automated Verification Suite
+
+Run the full automated test suite (geometry, kinematics, noise rejection, and configuration checks) without launching Gazebo:
+
+```bash
+python3 test/test_spatial_perception.py -v
+```
+
+---
+
+## Troubleshooting & FAQ
+
+### 1. `ImportError: numpy.core.multiarray failed to import`
+- **Cause:** NumPy 2.x is installed, which is binary incompatible with ROS 2 Humble's `cv_bridge` and system OpenCV.
+- **Fix:** Force downgrade to NumPy 1.x:
+  ```bash
+  pip3 install "numpy<2"
+  ```
+
+### 2. RViz / Gazebo Display Error with Docker: `cannot connect to X server`
+- **Cause:** Host X11 authorization not granted to the container.
+- **Fix:** Run the following command on the host terminal before starting Docker:
+  ```bash
+  xhost +local:root
+  ```
+
+### 3. Object coordinates jumping when the robot moves
+- **Cause:** Fixed reference frame is defaulting to a moving frame (e.g. `base_link` or `camera_link`).
+- **Fix:** Ensure `target_frame` is set to `'odom'` or `'map'`, and that robot odometry transforms are actively published (`ros2 run tf2_ros tf2_echo odom base_link`).
+
+---
+
+## License
+
+This project is licensed under the Apache 2.0 License. See [LICENSE.md](LICENSE.md) for details.
