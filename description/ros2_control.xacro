@@ -25,7 +25,7 @@
 
     <gazebo>
         <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
-            <parameters>/home/crl/ros2_ws/install/r_one/share/r_one/config/my_controllers.yaml</parameters>
+            <parameters>$(find r_one)/config/my_controllers.yaml</parameters>
         </plugin>
     </gazebo>
 </robot>

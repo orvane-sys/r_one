@@ -1,0 +1,81 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="spatial_perception_demo">
+    <!-- Global Light Source -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Ground Plane -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- Static Reference Obstacle (Table/Cabinet for Static World Model Demo) -->
+    <model name="static_obstacle">
+      <static>true</static>
+      <pose>2.5 -2.2 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.8 0.8 0.8</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.8 0.8 0.8</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.2 0.5 0.8 1</ambient>
+            <diffuse>0.2 0.5 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Animated Walking Human Actor for Dynamic Kinematics Demo -->
+    <actor name="walking_human">
+      <skin>
+        <filename>walk.dae</filename>
+      </skin>
+      <animation name="walking">
+        <filename>walk.dae</filename>
+        <interpolate_x>true</interpolate_x>
+      </animation>
+      <script>
+        <loop>true</loop>
+        <delay_start>0.0</delay_start>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="walking">
+          <!-- Waypoint 1: Walking left to right across robot front field of view -->
+          <waypoint>
+            <time>0.0</time>
+            <pose>2.5 -1.5 0 0 0 1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>4.0</time>
+            <pose>2.5 1.5 0 0 0 1.5708</pose>
+          </waypoint>
+          <!-- Waypoint 2: Turn around and walk back -->
+          <waypoint>
+            <time>4.5</time>
+            <pose>2.5 1.5 0 0 0 -1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>8.5</time>
+            <pose>2.5 -1.5 0 0 0 -1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>9.0</time>
+            <pose>2.5 -1.5 0 0 0 1.5708</pose>
+          </waypoint>
+        </trajectory>
+      </script>
+    </actor>
+  </world>
+</sdf>
+
