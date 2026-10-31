@@ -15,26 +15,75 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
+# Find dependencies
 find_package(ament_cmake REQUIRED)
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
+find_package(ament_cmake_python REQUIRED)
+
+# Install Python module package
+ament_python_install_package(${PROJECT_NAME})
 
 if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # uncomment the line when a copyright and license is not present in all source files
-  #set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # uncomment the line when this package is not in a git repo
-  #set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
+  set(ENV{PYTHONNOUSERSITE} "1")
+
+  find_package(ament_cmake_pytest QUIET)
+  if(ament_cmake_pytest_FOUND)
+    ament_add_pytest_test(spatial_perception_tests test/test_spatial_perception.py
+      ENV PYTHONNOUSERSITE=1
+    )
+    ament_add_pytest_test(launch_integration_tests test/test_launch_integration.py
+      ENV PYTHONNOUSERSITE=1
+    )
+  endif()
+
+  find_package(ament_cmake_flake8 QUIET)
+  if(ament_cmake_flake8_FOUND)
+    ament_flake8(r_one launch test)
+  endif()
+
+  find_package(ament_cmake_pep257 QUIET)
+  if(ament_cmake_pep257_FOUND)
+    ament_pep257(r_one launch test)
+  endif()
+
+  find_package(ament_cmake_xmllint QUIET)
+  if(ament_cmake_xmllint_FOUND)
+    ament_xmllint(package.xml)
+  endif()
+
+  find_package(ament_cmake_lint_cmake QUIET)
+  if(ament_cmake_lint_cmake_FOUND)
+    ament_lint_cmake()
+  endif()
 endif()
 
+# Install non-code asset directories
 install(
   DIRECTORY config description launch worlds
   DESTINATION share/${PROJECT_NAME}
+)
+
+# Install standard ROS 2 CLI executables (ros2 run r_one <node_name>)
+install(
+  PROGRAMS
+    scripts/spatial_vision_node
+    scripts/situational_awareness_node
+    scripts/sensor_fusion_node
+    scripts/mock_ai_node
+    scripts/record_sample_bag.sh
+    scripts/download_sample_bag.sh
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install backwards-compatible legacy script aliases
+install(
+  PROGRAMS
+    FakeSceneUnderStanding/spatial_vision_node.py
+    FakeSceneUnderStanding/real_ai2.py
+    FakeSceneUnderStanding/real_ai.py
+    FakeSceneUnderStanding/situational_awareness.py
+    FakeSceneUnderStanding/Sensor_fusion.py
+    FakeSceneUnderStanding/mock_ai.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()
