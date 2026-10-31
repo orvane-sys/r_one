@@ -1,6 +1,6 @@
 # ROS 2 Spatial Scene Understanding (`r_one`)
 
-[![ROS 2](https://img.shields.io/badge/ROS%202-Humble%20%7C%20Iron%20%7C%20Jazzy-blue.svg)](https://docs.ros.org/)
+[![ROS 2](https://img.shields.io/badge/ROS%202-Humble-blue.svg)](https://docs.ros.org/en/humble/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20LTS-E95420.svg)](https://ubuntu.com/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](docker-compose.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE.md)
@@ -8,7 +8,28 @@
 
 A real-time 3D spatial perception, multi-target tracking, and persistent world-modeling system for ROS 2 mobile robots.
 
-By mathematically fusing **YOLOv8 2D vision** with **2D LiDAR scans**, synchronized via `message_filters` and transformed into fixed world coordinates (`odom` / `map`) through **TF2**, `r_one` enables robots to detect, identify, track kinematics, and build true object permanence with zero spatial coordinate drift.
+By fusing **YOLOv8 2D vision** with **2D LiDAR scans**, synchronized via `message_filters` and transformed into a fixed world frame (`odom` / `map`) through **TF2**, `r_one` lets a robot detect objects, track their motion, and remember static ones. World coordinates are only as stable as the odometry or SLAM frame they are expressed in.
+
+> [!WARNING]
+> **Not safety-rated.** `r_one` is a research and learning project. Its emergency-braking node is a prototype with known gaps (see the status table) and must not be relied on to stop a real robot. Test in simulation or with the robot lifted off the ground, and keep a hardware e-stop within reach.
+
+## Project Status
+
+This table is the honest state of each feature. Anything not marked **Works** is under active audit and may not behave as the rest of this README describes.
+
+| Feature | Status | Notes |
+|---|---|---|
+| YOLOv8 + ByteTrack detection, lidar/depth ranging, TF projection to `odom` | Works (simulation) | Camera bearing is used directly as lidar bearing, so close, off-axis objects can be mis-ranged |
+| Velocity estimate and `STATIC`/`DYNAMIC` label | Experimental | A target moving slowly relative to the frame rate can be labelled `STATIC`; first sightings are `STATIC` |
+| Persistent world model | Experimental | Entries are not yet evicted, so ID churn can grow memory |
+| Kalman tracker and occlusion coasting | Experimental | Coasting uses a fixed time step |
+| Rosbag playback mode | Experimental | The sample bag download is not published yet, record your own with `scripts/record_sample_bag.sh` |
+| Lifecycle (`configure`/`activate`) | Experimental | State transitions work, but the model is loaded and inference runs regardless of state |
+| Emergency braking (`sensor_fusion_node`) | **Prototype, unsafe** | Misses most close obstacles, does not fail safe on lidar loss, and is not started by any launch file |
+| Alerts (`situational_awareness_node`) | Prototype | Not started by any launch file |
+| Nav2 and SLAM configs (`config/`) | Not wired | Written for an older Nav2 release and not launched by any launch file |
+| Driving the robot (teleop) | Planned | Controller topics are not yet connected to `/cmd_vel` |
+| Real hardware bringup | Planned | `ros2_control` is configured for Gazebo only |
 
 ---
 
@@ -27,7 +48,7 @@ flowchart TD
         SYNC["message_filters.ApproximateTimeSynchronizer<br/>(80ms window tolerance)"]
         YOLO["YOLOv8 + ByteTrack<br/>(2D BBoxes + Unique IDs)"]
         GEOM["Azimuth Geometry & 5-Beam Median Filter<br/>(Angle -> Depth Matching)"]
-        TRANS["TF2 Transform: laser_frame -> odom<br/>(Drift-Free Global Projection)"]
+        TRANS["TF2 Transform: laser_frame -> odom<br/>(Global Projection)"]
         KIN["Global Kinematics & Speed Estimator<br/>(v = dr / dt in odom frame)"]
         WM["Persistent World Model Memory<br/>(Object Permanence)"]
     end
@@ -58,7 +79,7 @@ flowchart TD
 ## Key Capabilities
 
 1. **Approximate Time Sensor Synchronization:** Synchronizes `/camera/image_raw` and `/scan` using `message_filters.ApproximateTimeSynchronizer` (slop: 80ms) and applies a 5-beam median filter to eliminate laser noise, dropout rays, and coordinate skew.
-2. **Drift-Free Global Coordinates (TF2):** Directly projects detected objects into the global odometry frame (`odom` or `map`). As the robot drives or rotates, stored static objects in `world_model` remain fixed in room coordinates.
+2. **Global Coordinates (TF2):** Projects detected objects into the global frame (`odom` or `map`). As the robot drives or rotates, stored static objects in `world_model` stay fixed in that frame (odometry itself drifts over time; use `map` with SLAM to bound it).
 3. **True Metric Kinematics & Velocity Projection:** Computes object velocity vectors $(\Delta x / \Delta t, \Delta y / \Delta t)$ in the fixed world frame. Projects future obstacle footprints ($t = 0.5\text{s} \dots 2.0\text{s}$) as a standard `sensor_msgs/msg/PointCloud2` into Nav2's local costmap so autonomous planners proactively route around walking pedestrians.
 4. **Interactive 3D RViz2 Displays:** Publishes standard `visualization_msgs/msg/MarkerArray` to `/perception/markers`:
    - **3D Bounding Cubes**: Color-coded green (`STATIC`) and orange (`DYNAMIC`).
@@ -83,7 +104,7 @@ xhost +local:root
 docker compose up
 ```
 
-> **Note:** If you are running on a machine without an NVIDIA GPU, Docker will automatically fall back to software OpenGL rendering (Mesa LLVMpipe).
+> **Note:** `docker-compose.yml` currently reserves an NVIDIA GPU. On a host without the NVIDIA Container Toolkit, `docker compose up` fails with `could not select device driver "nvidia"`. As a workaround, delete the `deploy:` block in `docker-compose.yml`. A CPU-default compose file is planned.
 
 ---
 
@@ -141,7 +162,7 @@ ros2 launch r_one spatial_scene.launch.py
 | `world` | `worlds/spatial_demo.world` | Gazebo world file (features walking human actor) | `world:=worlds/empty.world` |
 | `target_frame` | `odom` | Reference frame for world coordinates | `target_frame:=map` (with SLAM/Nav2) |
 | `depth_source` | `lidar` | Depth sensor backend: `'lidar'` or `'depth_image'` | `depth_source:=depth_image` |
-| `depth_topic` | `/camera/depth/image_raw` | Depth image topic when depth_source is depth_image | `depth_topic:=/camera/depth/image_raw` |
+| `depth_topic` | `camera/depth/image_raw` | Depth image topic when depth_source is depth_image | `depth_topic:=camera/depth/image_raw` |
 | `speed_threshold` | `0.15` | Velocity threshold (m/s) for dynamic objects | `speed_threshold:=0.25` |
 | `show_camera_window` | `false` | Open separate OpenCV 2D detection window | `show_camera_window:=true` |
 
@@ -246,7 +267,8 @@ ros2 param set /spatial_vision show_debug_window true
 - **Thread 3:** TF2 coordinate transformation lookups and pinhole back-projection.
 - **Thread 4:** Publisher serialization (`PointCloud2`, `MarkerArray`, `Detection3DArray`, Diagnostics).
 
-This eliminates callback starvation during 30–45ms CPU inference bursts on multi-core processors.
+> [!NOTE]
+> The thread list above describes the intended split. In the current code, frame processing (including inference) runs under a single state lock, so diagnostics and service calls can wait while a frame is being processed. Moving inference out of the lock is planned.
 
 ---
 
@@ -269,15 +291,15 @@ ros2 topic echo /diagnostics
 
 ### Managed Lifecycle Architecture (`LifecycleNode`)
 
-`SpatialVisionNode` implements industrial-grade ROS 2 lifecycle state machine management (`rclpy.lifecycle.LifecycleNode`):
-- `on_configure`: Allocates message buffers, initializes TF listener, loads neural network weights, and configures QoS endpoints.
-- `on_activate`: Activates managed lifecycle publishers, starts the 1.0 Hz diagnostics telemetry timer, and enables the perception pipeline loop.
-- `on_deactivate`: Suspends processing loop, pauses publishers, and flushes transient predicted trajectory markers.
-- `on_cleanup`: Unloads neural network weights, wipes static world model caches, and flushes tracker history.
-- `on_shutdown`: Graceful destruction and socket teardown.
+`SpatialVisionNode` is a `rclpy.lifecycle.LifecycleNode`, so it exposes the standard lifecycle services and `ros2 lifecycle` commands.
+
+> [!WARNING]
+> **Current limitation:** the lifecycle state is not yet enforced. The YOLO model is loaded when the node is constructed, publishers are ordinary (non-lifecycle) publishers, and frames are still processed while the node is `unconfigured` or after `deactivate`. `on_cleanup` does not unload the model. Making the transitions real (load in `configure`, process only while `active`) is planned.
+
+- `on_activate` / `on_deactivate` / `on_cleanup`: update the reported state and clear some cached markers and world-model data.
 
 > [!TIP]
-> **Zero-Friction Autostart:** Parameter `autostart: true` (default) automatically triggers `configure` and `activate` transitions upon boot. Everyday users launching `ros2 launch r_one spatial_scene.launch.py` require zero manual lifecycle commands, while industrial managers (Nav2 Lifecycle Manager or `ros2 lifecycle set ...`) retain full state-machine control when `autostart:=false`.
+> **Autostart:** parameter `autostart: true` (default) triggers `configure` and `activate` on boot, so launching `ros2 launch r_one spatial_scene.launch.py` needs no manual lifecycle commands.
 
 ```bash
 # Query current lifecycle state
@@ -300,7 +322,7 @@ Exposes standard ROS 2 service servers for live memory and tracker management wi
 # 1. Clear static world model and wipe RViz cylinder markers
 ros2 service call /spatial_vision/clear_world_model std_srvs/srv/Trigger
 
-# 2. Reset ByteTrack target IDs and kinematics buffers
+# 2. Reset kinematics buffers (note: the ByteTrack state inside the YOLO model is not reset yet)
 ros2 service call /spatial_vision/reset_tracker std_srvs/srv/Trigger
 ```
 
@@ -316,7 +338,7 @@ Along with EMA velocity smoothing, `SpatialVisionNode` supports a 2D state-space
 
 ### Multi-Robot Scalability & Relative Namespacing
 
-All topics follow REP 103 / REP 105 relative namespace purity (no hardcoded leading `/`). Nodes can be placed inside robot namespaces for multi-robot fleets without topic collisions:
+All topics follow REP 103 / REP 105 relative namespace purity (no hardcoded leading `/`). Nodes can be placed inside a robot namespace so their topics do not collide. Multi-robot use is not fully supported yet: TF is published on the global `/tf` and frame names are not prefixed, so frames from two robots would still clash.
 
 ```bash
 # Run isolated perception pipeline for robot_1
@@ -346,25 +368,28 @@ ros2 run r_one spatial_vision_node --ros-args -r __ns:=/robot_1
 | `perception/detections_3d` | `vision_msgs/msg/Detection3DArray` | Published | Reliable, Volatile, Depth=10 | Standard ROS 2 3D detections for Nav2 / autonomous planners |
 | `perception/dynamic_costmap_obstacles` | `sensor_msgs/msg/PointCloud2` | Published | Best Effort, Volatile, Depth=5 | Projected future obstacle footprint points for Nav2 dynamic costmap |
 | `/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | Published | Reliable, Volatile, Depth=10 | System health telemetry (FPS, cycle latency, active tracks) |
-| `robot_alerts` | `std_msgs/msg/String` | Published | Reliable, Volatile, Depth=10 | Safety zone warnings (`SAFE`, `CAUTION`, `STOP`) |
-| `cmd_vel_fusion` | `geometry_msgs/msg/Twist` | Published | Reliable, Volatile, Depth=10 | Active Emergency Braking velocity commands |
+| `robot_alerts` | `std_msgs/msg/String` | Published | Reliable, Volatile, Depth=10 | Safety zone warnings (`SAFE_PROCEED`, `CAUTION_SLOW_DOWN`, `HIGH_RISK_STOP`) |
+| `cmd_vel_fusion` | `geometry_msgs/msg/Twist` | Published | Reliable, Volatile, Depth=10 | Prototype emergency-braking commands (not consumed by any launch file, see status table) |
 
 ### Services
 
 | Service | Type | Description |
 |---|---|---|
 | `~/clear_world_model` | `std_srvs/srv/Trigger` | Clears all cached static objects from world model memory and wipes RViz visual markers |
-| `~/reset_tracker` | `std_srvs/srv/Trigger` | Resets active ByteTrack IDs, kinematics history, and Kalman filter state |
+| `~/reset_tracker` | `std_srvs/srv/Trigger` | Resets kinematics history and Kalman filter state (ByteTrack IDs are not reset yet) |
 
 ---
 
 ## Automated Verification Suite
 
-Run the full automated test suite (geometry, kinematics, noise rejection, and configuration checks) without launching Gazebo:
+Run the test suite without launching Gazebo:
 
 ```bash
-python3 test/test_spatial_perception.py -v
+colcon test --packages-select r_one && colcon test-result --verbose
 ```
+
+> [!NOTE]
+> The current unit tests exercise copies of the algorithms rather than importing the `r_one` modules, so a passing run does not yet prove the node code is correct. Replacing them is part of the roadmap.
 
 ---
 

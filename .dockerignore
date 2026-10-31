@@ -11,3 +11,9 @@ __pycache__/
 .ipynb_checkpoints
 .gemini/
 
+.vscode/
+.idea/
+sample_bags/
+*.db3
+*.mcap
+*.pt

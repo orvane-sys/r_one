@@ -6,3 +6,19 @@
 *.pgm
 *.pt
 ros2_datasets/
+
+# Editor / IDE state (browse.vc.db alone can exceed 1 GB)
+.vscode/
+.idea/
+
+# colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# Downloaded or recorded sample bags
+sample_bags/
