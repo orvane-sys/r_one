@@ -1,0 +1,19 @@
+# Python packages that rosdep cannot provide. Install with:
+#   pip3 install -r requirements.txt
+#
+# ROS 2 Humble's cv_bridge is built against NumPy 1.x, so NumPy 2 breaks cv_bridge,
+# cv2 and ultralytics at import time (the node then idles). Keep numpy below 2.
+numpy>=1.23,<2
+# Not the -headless build: show_debug_window uses cv2.imshow.
+opencv-python>=4.8,<4.11
+ultralytics>=8.3,<8.5
+# ByteTrack association backend used by ultralytics.
+lapx>=0.5
+
+# torch/torchvision are installed separately because the right wheel depends on your
+# hardware (the Dockerfile does this with the TORCH_INDEX_URL build argument):
+#   CPU:  pip3 install "torch>=2.2,<2.9" torchvision --index-url https://download.pytorch.org/whl/cpu
+#   GPU:  pip3 install "torch>=2.2,<2.9" torchvision   (default PyPI wheels include CUDA)
+#
+# These are version ranges, not exact pins. Once the Docker image builds, record the
+# exact versions with:  docker run --rm r_one:latest pip3 freeze > requirements.lock

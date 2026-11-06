@@ -1,20 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 project(r_one)
 
-# Default to C99
-if(NOT CMAKE_C_STANDARD)
-  set(CMAKE_C_STANDARD 99)
-endif()
-
-# Default to C++14
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
-endif()
-
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
-
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
@@ -23,37 +9,37 @@ find_package(ament_cmake_python REQUIRED)
 ament_python_install_package(${PROJECT_NAME})
 
 if(BUILD_TESTING)
+  # Keep tests hermetic: ignore packages in ~/.local (a stray pytest plugin there can break
+  # pytest itself, which makes CMake skip the pytest tests below).
   set(ENV{PYTHONNOUSERSITE} "1")
 
-  find_package(ament_cmake_pytest QUIET)
-  if(ament_cmake_pytest_FOUND)
-    ament_add_pytest_test(spatial_perception_tests test/test_spatial_perception.py
-      ENV PYTHONNOUSERSITE=1
-    )
-    ament_add_pytest_test(launch_integration_tests test/test_launch_integration.py
-      ENV PYTHONNOUSERSITE=1
-    )
-  endif()
+  # Required, not QUIET: a missing test dependency must fail the build instead of
+  # silently dropping tests (rosdep installs these from the test_depend entries).
+  find_package(ament_cmake_pytest REQUIRED)
+  find_package(ament_cmake_ros REQUIRED)
+  find_package(ament_lint_auto REQUIRED)
 
-  find_package(ament_cmake_flake8 QUIET)
-  if(ament_cmake_flake8_FOUND)
-    ament_flake8(r_one launch test)
-  endif()
+  # This package has no copyright headers and no C++ sources
+  set(ament_cmake_copyright_FOUND TRUE)
+  set(ament_cmake_cpplint_FOUND TRUE)
+  set(ament_cmake_uncrustify_FOUND TRUE)
+  ament_lint_auto_find_test_dependencies()
 
-  find_package(ament_cmake_pep257 QUIET)
-  if(ament_cmake_pep257_FOUND)
-    ament_pep257(r_one launch test)
-  endif()
+  # Unit tests that import the real r_one modules
+  ament_add_pytest_test(unit_tests test/test_package_smoke.py
+    ENV PYTHONNOUSERSITE=1
+  )
 
-  find_package(ament_cmake_xmllint QUIET)
-  if(ament_cmake_xmllint_FOUND)
-    ament_xmllint(package.xml)
-  endif()
+  # Regression tests for the crash and launch bugs. The launch files need the installed package.
+  ament_add_pytest_test(guard_tests test/test_spatial_vision_guards.py
+    ENV PYTHONNOUSERSITE=1
+  )
 
-  find_package(ament_cmake_lint_cmake QUIET)
-  if(ament_cmake_lint_cmake_FOUND)
-    ament_lint_cmake()
-  endif()
+  # Launch-based integration test, run on an isolated ROS_DOMAIN_ID
+  ament_add_ros_isolated_pytest_test(launch_integration_tests test/test_launch_integration.py
+    ENV PYTHONNOUSERSITE=1
+    TIMEOUT 120
+  )
 endif()
 
 # Install non-code asset directories
@@ -71,18 +57,6 @@ install(
     scripts/mock_ai_node
     scripts/record_sample_bag.sh
     scripts/download_sample_bag.sh
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-# Install backwards-compatible legacy script aliases
-install(
-  PROGRAMS
-    FakeSceneUnderStanding/spatial_vision_node.py
-    FakeSceneUnderStanding/real_ai2.py
-    FakeSceneUnderStanding/real_ai.py
-    FakeSceneUnderStanding/situational_awareness.py
-    FakeSceneUnderStanding/Sensor_fusion.py
-    FakeSceneUnderStanding/mock_ai.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

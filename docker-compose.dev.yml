@@ -1,0 +1,8 @@
+# Development override: mounts this checkout over the copy baked into the image.
+# The package is built with --symlink-install, so Python, launch and config edits apply
+# on the next launch. Re-run `colcon build` inside the container after adding files.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+services:
+  r_one:
+    volumes:
+      - .:/home/ros/ros2_ws/src/r_one
