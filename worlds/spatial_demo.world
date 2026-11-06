@@ -11,31 +11,33 @@
       <uri>model://ground_plane</uri>
     </include>
 
-    <!-- Static Reference Obstacle (Table/Cabinet for Static World Model Demo) -->
-    <model name="static_obstacle">
-      <static>true</static>
-      <pose>2.5 -2.2 0.4 0 0 0</pose>
-      <link name="link">
-        <collision name="collision">
-          <geometry>
-            <box>
-              <size>0.8 0.8 0.8</size>
-            </box>
-          </geometry>
-        </collision>
-        <visual name="visual">
-          <geometry>
-            <box>
-              <size>0.8 0.8 0.8</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>0.2 0.5 0.8 1</ambient>
-            <diffuse>0.2 0.5 0.8 1</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
+    <!-- Standing person for the static world model demo. A plain box is not a COCO class, so
+         YOLOv8 never reports it. stand.dae ships with Gazebo, so no model download is needed. -->
+    <actor name="standing_person">
+      <pose>2.5 -2.4 0 0 0 3.14</pose>
+      <skin>
+        <filename>stand.dae</filename>
+        <scale>1.0</scale>
+      </skin>
+      <animation name="standing">
+        <filename>stand.dae</filename>
+        <scale>1.0</scale>
+      </animation>
+      <script>
+        <loop>true</loop>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="standing">
+          <waypoint>
+            <time>0</time>
+            <pose>2.5 -2.4 0 0 0 3.14</pose>
+          </waypoint>
+          <waypoint>
+            <time>10</time>
+            <pose>2.5 -2.4 0 0 0 3.14</pose>
+          </waypoint>
+        </trajectory>
+      </script>
+    </actor>
 
     <!-- Animated Walking Human Actor for Dynamic Kinematics Demo -->
     <actor name="walking_human">

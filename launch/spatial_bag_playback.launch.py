@@ -2,8 +2,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -11,20 +11,25 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_r_one = get_package_share_directory('r_one')
     rviz_config = os.path.join(pkg_r_one, 'config', 'drive_bot.rviz')
-    default_bag = os.path.join(
-        os.getcwd(), 'sample_bags', 'sample_spatial_run.mcap'
-    )
+    # ros2 bag record writes a directory, so this names the directory, not a file
+    default_bag = os.path.join(os.getcwd(), 'sample_bags', 'sample_spatial_run')
 
     bag_path_arg = DeclareLaunchArgument(
         'bag_path',
         default_value=default_bag,
-        description='Path to the .mcap rosbag file or directory',
+        description='Path to the rosbag directory',
     )
 
     loop_arg = DeclareLaunchArgument(
         'loop',
         default_value='true',
         description='Loop bag playback continuously',
+    )
+
+    start_delay_arg = DeclareLaunchArgument(
+        'start_delay',
+        default_value='8.0',
+        description='Seconds to wait for the detector to load before playback starts',
     )
 
     rate_arg = DeclareLaunchArgument(
@@ -41,7 +46,8 @@ def generate_launch_description():
 
     depth_source_arg = DeclareLaunchArgument(
         'depth_source',
-        default_value='lidar',
+        # The sample bag comes from Gazebo, where the CPU lidar cannot see the actor
+        default_value='depth_image',
         description="Depth sensor backend: 'lidar' or 'depth_image'",
     )
 
@@ -52,18 +58,30 @@ def generate_launch_description():
     )
 
     # Rosbag player process with simulation clock publishing
-    bag_player = ExecuteProcess(
-        cmd=[
-            'ros2',
-            'bag',
-            'play',
-            LaunchConfiguration('bag_path'),
-            '--clock',
-            '--rate',
-            LaunchConfiguration('rate'),
-            '--loop',
+    play_cmd = [
+        'ros2',
+        'bag',
+        'play',
+        LaunchConfiguration('bag_path'),
+        '--clock',
+        '--rate',
+        LaunchConfiguration('rate'),
+    ]
+
+    bag_player = TimerAction(
+        period=LaunchConfiguration('start_delay'),
+        actions=[
+            ExecuteProcess(
+                cmd=play_cmd + ['--loop'],
+                output='screen',
+                condition=IfCondition(LaunchConfiguration('loop')),
+            ),
+            ExecuteProcess(
+                cmd=play_cmd,
+                output='screen',
+                condition=UnlessCondition(LaunchConfiguration('loop')),
+            ),
         ],
-        output='screen',
     )
 
     # Spatial vision perception node
@@ -101,6 +119,7 @@ def generate_launch_description():
     return LaunchDescription([
         bag_path_arg,
         loop_arg,
+        start_delay_arg,
         rate_arg,
         target_frame_arg,
         depth_source_arg,

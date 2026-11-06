@@ -17,7 +17,15 @@ echo " Topics: Camera, CameraInfo, LiDAR, Depth Image, TF"
 echo " Press Ctrl+C when finished recording (15-20s recommended)."
 echo "=========================================================="
 
-ros2 bag record -s mcap -o "${FULL_PATH}" \
+# Gazebo stamps messages with simulation time, so the bag has to record on that clock too.
+# Without this, playback publishes a /clock that does not match the message stamps.
+SIM_TIME_FLAG=()
+if ros2 topic list | grep -qx '/clock'; then
+  SIM_TIME_FLAG=(--use-sim-time)
+fi
+
+# This writes a directory holding metadata.yaml and sample_spatial_run_0.mcap
+ros2 bag record -s mcap "${SIM_TIME_FLAG[@]}" -o "${FULL_PATH}" \
   /camera/image_raw \
   /camera/camera_info \
   /scan \

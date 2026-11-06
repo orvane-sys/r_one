@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import math
+import os
 import struct
+import sys
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -83,6 +85,71 @@ except ImportError:
         SUCCESS = 0
         FAILURE = 1
         ERROR = 2
+
+
+def resolve_model_path(name: str) -> str:
+    """Prefer a weights file in $R_ONE_MODEL_DIR (set in the Docker image) over a download."""
+    model_dir = os.environ.get('R_ONE_MODEL_DIR')
+    if model_dir and not os.path.isabs(name):
+        candidate = os.path.join(model_dir, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return name
+
+
+# name: (predicate, reason). NaN fails every predicate, so it is rejected too.
+PARAMETER_RULES = {
+    'speed_threshold': (
+        lambda value: value >= 0.0,
+        "speed_threshold must be non-negative",
+    ),
+    'process_every_n_frames': (
+        lambda value: value >= 1,
+        "process_every_n_frames must be >= 1",
+    ),
+    'img_size': (
+        lambda value: value >= 1,
+        "img_size must be >= 1",
+    ),
+    'sync_slop': (
+        lambda value: value > 0.0,
+        "sync_slop must be > 0.0",
+    ),
+    'ema_alpha': (
+        lambda value: 0.0 < value <= 1.0,
+        "ema_alpha must be in range (0.0, 1.0]",
+    ),
+    'tracking_filter': (
+        lambda value: str(value).lower() in ('ema', 'kalman'),
+        "tracking_filter must be 'ema' or 'kalman'",
+    ),
+    'depth_source': (
+        lambda value: value in ('lidar', 'depth_image'),
+        "depth_source must be 'lidar' or 'depth_image'",
+    ),
+}
+
+
+def validate_parameter(name: str, value) -> Optional[str]:
+    """Return why a parameter value is invalid, or None when it is fine."""
+    rule = PARAMETER_RULES.get(name)
+    if rule is None or rule[0](value):
+        return None
+    return rule[1]
+
+
+def intrinsics_are_valid(k) -> bool:
+    """Check a CameraInfo K matrix. Uncalibrated cameras often publish all zeros."""
+    fx, cx, fy, cy = k[0], k[2], k[4], k[5]
+    if not all(math.isfinite(value) for value in (fx, cx, fy, cy)):
+        return False
+    return fx > 0.0 and fy > 0.0
+
+
+def debug_window_supported() -> bool:
+    """Check for OpenCV and a display, because a window without a display aborts the process."""
+    has_display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+    return cv2 is not None and bool(has_display)
 
 
 class KalmanTracker2D:
@@ -188,7 +255,7 @@ class SpatialVisionNode(LifecycleNode):
             .get_parameter_value()
             .bool_value
         )
-        yolo_path = (
+        yolo_path = resolve_model_path(
             self.get_parameter('yolo_model').get_parameter_value().string_value
         )
         self.img_size = (
@@ -197,6 +264,11 @@ class SpatialVisionNode(LifecycleNode):
         self.autostart = (
             self.get_parameter('autostart').get_parameter_value().bool_value
         )
+
+        for name in PARAMETER_RULES:
+            error = validate_parameter(name, self.get_parameter(name).value)
+            if error is not None:
+                raise ValueError(error)
 
         self.add_on_set_parameters_callback(self.parameters_callback)
 
@@ -359,6 +431,13 @@ class SpatialVisionNode(LifecycleNode):
 
     def info_callback(self, msg: CameraInfo):
         if self.fx is None or self.cx is None:
+            if not intrinsics_are_valid(msg.k):
+                self.get_logger().warn(
+                    "Ignoring camera_info with an invalid K matrix. Calibrate the "
+                    "camera: nothing is detected until a valid K arrives.",
+                    throttle_duration_sec=10.0,
+                )
+                return
             self.fx = msg.k[0]
             self.cx = msg.k[2]
             self.fy = msg.k[4]
@@ -400,15 +479,24 @@ class SpatialVisionNode(LifecycleNode):
         return window_ranges[len(window_ranges) // 2]
 
     def extract_depth_image_distance(
-        self, u: float, v: float, depth_image: np.ndarray
+        self,
+        u: float,
+        v: float,
+        depth_image: np.ndarray,
+        half_width: float = 2.0,
+        half_height: float = 2.0,
     ) -> Optional[float]:
+        # Use the nearest quartile of the patch: the centre of a box can fall between a
+        # person's legs, so a reading there may hit the background.
         h, w = depth_image.shape[:2]
         ui, vi = int(round(u)), int(round(v))
         if not (0 <= ui < w and 0 <= vi < h):
             return None
 
-        u_min, u_max = max(0, ui - 2), min(w, ui + 3)
-        v_min, v_max = max(0, vi - 2), min(h, vi + 3)
+        half_u = max(2, int(half_width))
+        half_v = max(2, int(half_height))
+        u_min, u_max = max(0, ui - half_u), min(w, ui + half_u + 1)
+        v_min, v_max = max(0, vi - half_v), min(h, vi + half_v + 1)
         window = depth_image[v_min:v_max, u_min:u_max]
 
         valid_vals = window[
@@ -416,7 +504,7 @@ class SpatialVisionNode(LifecycleNode):
         ]
         if len(valid_vals) == 0:
             return None
-        return float(np.median(valid_vals))
+        return float(np.percentile(valid_vals, 25))
 
     def transform_point_to_target(
         self,
@@ -462,10 +550,21 @@ class SpatialVisionNode(LifecycleNode):
         )
 
     def sync_depth_callback(self, img_msg: Image, depth_msg: Image):
-        cv_depth = self.bridge.imgmsg_to_cv2(
-            depth_msg, desired_encoding='passthrough'
-        )
-        depth_array = np.array(cv_depth, dtype=np.float32)
+        if self.bridge is None:
+            return
+
+        try:
+            cv_depth = self.bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding='passthrough'
+            )
+            depth_array = np.array(cv_depth, dtype=np.float32)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Skipping frame, could not read the depth image: {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return
+
         if depth_msg.encoding == '16UC1':
             depth_array = depth_array / 1000.0  # mm to meters
 
@@ -497,14 +596,21 @@ class SpatialVisionNode(LifecycleNode):
 
         with self.state_lock:
             start_time = time.perf_counter()
-            cv_image = self.bridge.imgmsg_to_cv2(img_msg, 'bgr8')
-            results = self.model.track(
-                cv_image,
-                persist=True,
-                tracker='bytetrack.yaml',
-                imgsz=self.img_size,
-                verbose=False,
-            )
+            try:
+                cv_image = self.bridge.imgmsg_to_cv2(img_msg, 'bgr8')
+                results = self.model.track(
+                    cv_image,
+                    persist=True,
+                    tracker='bytetrack.yaml',
+                    imgsz=self.img_size,
+                    verbose=False,
+                )
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Skipping frame, detection failed: {exc}",
+                    throttle_duration_sec=5.0,
+                )
+                return
 
             stamp_sec = stamp.sec + stamp.nanosec * 1e-9
             now_sec = self.get_clock().now().nanoseconds / 1e9
@@ -544,8 +650,13 @@ class SpatialVisionNode(LifecycleNode):
                     v = float((y1 + y2) / 2)
 
                     if is_depth_image:
+                        # Sample the middle third of the box
                         distance = self.extract_depth_image_distance(
-                            u, v, sensor_data
+                            u,
+                            v,
+                            sensor_data,
+                            half_width=float(x2 - x1) / 6.0,
+                            half_height=float(y2 - y1) / 6.0,
                         )
                         if distance is None:
                             continue
@@ -772,6 +883,12 @@ class SpatialVisionNode(LifecycleNode):
             ):
                 self.detection_3d_pub.publish(detection_3d_array)
 
+            if self.show_debug_window and not debug_window_supported():
+                self.show_debug_window = False
+                self.get_logger().warn(
+                    "show_debug_window turned off: OpenCV or a display is missing."
+                )
+
             if self.show_debug_window:
                 annotated_frame = results[0].plot()
                 cv2.namedWindow("Robot's 3D Spatial Vision", cv2.WINDOW_NORMAL)
@@ -785,33 +902,24 @@ class SpatialVisionNode(LifecycleNode):
                 self.cycle_times.pop(0)
 
     def parameters_callback(self, params):
+        # Check every value first so a multi-parameter set applies fully or not at all.
+        for param in params:
+            error = validate_parameter(param.name, param.value)
+            if error is not None:
+                return SetParametersResult(successful=False, reason=error)
+
         for param in params:
             if param.name == 'speed_threshold':
-                if param.value < 0.0:
-                    return SetParametersResult(
-                        successful=False,
-                        reason="speed_threshold must be non-negative",
-                    )
                 self.speed_threshold = float(param.value)
                 self.get_logger().info(
                     f"Dynamic reconfigure: speed_threshold set to {self.speed_threshold:.2f} m/s"
                 )
             elif param.name == 'process_every_n_frames':
-                if param.value < 1:
-                    return SetParametersResult(
-                        successful=False,
-                        reason="process_every_n_frames must be >= 1",
-                    )
                 self.process_every_n = int(param.value)
                 self.get_logger().info(
                     f"Dynamic reconfigure: process_every_n_frames set to {self.process_every_n}"
                 )
             elif param.name == 'sync_slop':
-                if param.value <= 0.0:
-                    return SetParametersResult(
-                        successful=False,
-                        reason="sync_slop must be > 0.0",
-                    )
                 self.sync_slop = float(param.value)
                 if hasattr(self, 'time_sync') and self.time_sync is not None:
                     self.time_sync.slop = Duration(seconds=self.sync_slop)
@@ -819,23 +927,12 @@ class SpatialVisionNode(LifecycleNode):
                     f"Dynamic reconfigure: sync_slop set to {self.sync_slop:.3f} s"
                 )
             elif param.name == 'ema_alpha':
-                if not (0.0 < param.value <= 1.0):
-                    return SetParametersResult(
-                        successful=False,
-                        reason="ema_alpha must be in range (0.0, 1.0]",
-                    )
                 self.ema_alpha = float(param.value)
                 self.get_logger().info(
                     f"Dynamic reconfigure: ema_alpha set to {self.ema_alpha:.2f}"
                 )
             elif param.name == 'tracking_filter':
-                val = str(param.value).lower()
-                if val not in ['ema', 'kalman']:
-                    return SetParametersResult(
-                        successful=False,
-                        reason="tracking_filter must be 'ema' or 'kalman'",
-                    )
-                self.tracking_filter = val
+                self.tracking_filter = str(param.value).lower()
                 self.get_logger().info(
                     f"Dynamic reconfigure: tracking_filter set to {self.tracking_filter}"
                 )
@@ -1157,7 +1254,12 @@ class SpatialVisionNode(LifecycleNode):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SpatialVisionNode()
+    try:
+        node = SpatialVisionNode()
+    except ValueError as exc:
+        print(f"spatial_vision: invalid parameter: {exc}", file=sys.stderr)
+        rclpy.shutdown()
+        sys.exit(1)
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

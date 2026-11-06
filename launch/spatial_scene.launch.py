@@ -8,9 +8,9 @@ from launch.actions import (
     GroupAction,
     IncludeLaunchDescription,
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -37,6 +37,18 @@ def generate_launch_description():
         description='Path to Gazebo world file (defaults to spatial_demo.world)',
     )
 
+    gui_arg = DeclareLaunchArgument(
+        'gui',
+        default_value='true',
+        description='Open the Gazebo window. Set false to run gzserver headless',
+    )
+
+    robot_tf_arg = DeclareLaunchArgument(
+        'publish_robot_tf',
+        default_value='true',
+        description='Start robot_state_publisher. Set false if your robot already runs it',
+    )
+
     rviz_arg = DeclareLaunchArgument(
         'rviz',
         default_value='true',
@@ -51,14 +63,35 @@ def generate_launch_description():
 
     depth_source_arg = DeclareLaunchArgument(
         'depth_source',
-        default_value='lidar',
-        description="Depth source for 3D coordinate estimation: 'lidar' or 'depth_image'",
+        # Gazebo actors have no collisions, so the simulated CPU lidar cannot see the
+        # walking person. Simulation therefore ranges with the depth camera.
+        default_value=PythonExpression([
+            "'depth_image' if '",
+            LaunchConfiguration('sim'),
+            "'.lower() in ('true', '1') else 'lidar'",
+        ]),
+        description=(
+            "Depth source for 3D coordinate estimation: 'lidar' or 'depth_image'. "
+            "Defaults to depth_image in simulation and lidar on hardware"
+        ),
     )
 
     depth_topic_arg = DeclareLaunchArgument(
         'depth_topic',
         default_value='camera/depth/image_raw',
         description='Depth image topic name when depth_source is set to depth_image',
+    )
+
+    tracking_filter_arg = DeclareLaunchArgument(
+        'tracking_filter',
+        default_value='ema',
+        description="Position and velocity filter: 'ema' or 'kalman'",
+    )
+
+    ema_alpha_arg = DeclareLaunchArgument(
+        'ema_alpha',
+        default_value='0.35',
+        description='EMA smoothing weight in (0.0, 1.0], used when tracking_filter is ema',
     )
 
     speed_threshold_arg = DeclareLaunchArgument(
@@ -75,14 +108,14 @@ def generate_launch_description():
 
     process_every_n_arg = DeclareLaunchArgument(
         'process_every_n_frames',
-        default_value='5',
+        default_value='2',
         description='Process every N-th frame to reduce compute overhead',
     )
 
     show_camera_window_arg = DeclareLaunchArgument(
         'show_camera_window',
         default_value='false',
-        description='Open OpenCV 2D detection debug window (RViz displays camera natively)',
+        description='Open the OpenCV 2D detection debug window',
     )
 
     yolo_model_arg = DeclareLaunchArgument(
@@ -99,8 +132,8 @@ def generate_launch_description():
 
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
-        default_value='true',
-        description='Enforce simulation clock across all nodes',
+        default_value=LaunchConfiguration('sim'),
+        description='Use the /clock topic. Defaults to true only in simulation',
     )
 
     # --- 1. Simulation Components (Optional) ---
@@ -111,10 +144,10 @@ def generate_launch_description():
         launch_arguments={
             'use_sim_time': LaunchConfiguration('use_sim_time')
         }.items(),
+        condition=IfCondition(LaunchConfiguration('publish_robot_tf')),
     )
 
-    gazebo_cmd = [
-        'gazebo',
+    gazebo_args = [
         '--verbose',
         '-s',
         'libgazebo_ros_init.so',
@@ -123,9 +156,16 @@ def generate_launch_description():
         LaunchConfiguration('world'),
     ]
 
-    gazebo_process = ExecuteProcess(
-        cmd=gazebo_cmd,
+    gazebo_gui_process = ExecuteProcess(
+        cmd=['gazebo'] + gazebo_args,
         output='screen',
+        condition=IfCondition(LaunchConfiguration('gui')),
+    )
+
+    gazebo_headless_process = ExecuteProcess(
+        cmd=['gzserver'] + gazebo_args,
+        output='screen',
+        condition=UnlessCondition(LaunchConfiguration('gui')),
     )
 
     spawn_robot = Node(
@@ -163,8 +203,8 @@ def generate_launch_description():
     simulation_group = GroupAction(
         condition=IfCondition(LaunchConfiguration('sim')),
         actions=[
-            rsp_launch,
-            gazebo_process,
+            gazebo_gui_process,
+            gazebo_headless_process,
             spawn_robot,
             diff_drive_spawner,
             joint_broad_spawner,
@@ -182,6 +222,8 @@ def generate_launch_description():
                 'target_frame': LaunchConfiguration('target_frame'),
                 'depth_source': LaunchConfiguration('depth_source'),
                 'depth_topic': LaunchConfiguration('depth_topic'),
+                'tracking_filter': LaunchConfiguration('tracking_filter'),
+                'ema_alpha': LaunchConfiguration('ema_alpha'),
                 'speed_threshold': LaunchConfiguration('speed_threshold'),
                 'sync_slop': LaunchConfiguration('sync_slop'),
                 'process_every_n_frames': LaunchConfiguration(
@@ -209,10 +251,14 @@ def generate_launch_description():
     return LaunchDescription([
         sim_arg,
         world_arg,
+        gui_arg,
+        robot_tf_arg,
         rviz_arg,
         target_frame_arg,
         depth_source_arg,
         depth_topic_arg,
+        tracking_filter_arg,
+        ema_alpha_arg,
         speed_threshold_arg,
         sync_slop_arg,
         process_every_n_arg,
@@ -220,6 +266,7 @@ def generate_launch_description():
         yolo_model_arg,
         img_size_arg,
         use_sim_time_arg,
+        rsp_launch,
         simulation_group,
         spatial_vision_node,
         rviz_node,

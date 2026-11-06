@@ -2,6 +2,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -22,6 +23,18 @@ def generate_launch_description():
         description='Whether to launch RViz2 automatically'
     )
 
+    show_debug_window_arg = DeclareLaunchArgument(
+        'show_debug_window',
+        default_value='false',
+        description='Open the OpenCV 2D detection window (needs a display)'
+    )
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use the /clock topic. Set true when running against Gazebo or a bag'
+    )
+
     spatial_vision_node = Node(
         package='r_one',
         executable='spatial_vision_node',
@@ -32,9 +45,10 @@ def generate_launch_description():
             'speed_threshold': 0.15,
             'sync_slop': 0.08,
             'process_every_n_frames': 5,
-            'show_debug_window': True,
+            'show_debug_window': LaunchConfiguration('show_debug_window'),
             'yolo_model': 'yolov8n.pt',
-            'img_size': 320
+            'img_size': 320,
+            'use_sim_time': LaunchConfiguration('use_sim_time')
         }]
     )
 
@@ -43,13 +57,16 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         arguments=['-d', rviz_config_path],
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        condition=IfCondition(LaunchConfiguration('open_rviz')),
         output='screen'
     )
 
     return LaunchDescription([
         target_frame_arg,
         open_rviz_arg,
+        show_debug_window_arg,
+        use_sim_time_arg,
         spatial_vision_node,
         rviz_node
     ])
