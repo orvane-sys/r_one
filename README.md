@@ -23,11 +23,11 @@ This table is the honest state of each feature. Anything not marked **Works** is
 | Velocity estimate and `STATIC`/`DYNAMIC` label | Experimental | A target moving slowly relative to the frame rate can be labelled `STATIC`; first sightings are `STATIC`. Low frame rates cause ID churn, which makes this worse (software-rendered Gazebo runs at about 5 FPS) |
 | Persistent world model | Experimental | Entries are not yet evicted, so ID churn can grow memory. Walking people can be stored as ghost entries |
 | Kalman tracker and occlusion coasting | Experimental | Coasting uses a fixed time step |
-| Rosbag playback mode | Experimental | Download the sample bag with `scripts/download_sample_bag.sh`, or record your own with `scripts/record_sample_bag.sh` |
+| Rosbag playback mode | Experimental | Download the sample bag with `r_one/scripts/download_sample_bag.sh`, or record your own with `scripts/record_sample_bag.sh` |
 | Lifecycle (`configure`/`activate`) | Experimental | State transitions work, but the model is loaded and inference runs regardless of state |
 | Emergency braking (`sensor_fusion_node`) | **Prototype, unsafe** | Misses most close obstacles, does not fail safe on lidar loss, and is not started by any launch file |
 | Alerts (`situational_awareness_node`) | Prototype | Not started by any launch file |
-| Nav2 and SLAM configs (`config/`) | Not wired | Written for an older Nav2 release and not launched by any launch file |
+| Nav2 and SLAM configs (`r_one_bringup/config/`) | Not wired | Written for an older Nav2 release and not launched by any launch file |
 | Driving the robot (teleop) | Planned | Controller topics are not yet connected to `/cmd_vel` |
 | Real hardware bringup | Planned | `ros2_control` is configured for Gazebo only. `sim:=false` starts perception alone and is untested on a real robot |
 
@@ -127,7 +127,7 @@ The image has the YOLOv8n weights built in, so it starts without network access.
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone https://github.com/orvane-sys/r_one.git
 
-# 2. Install every ROS dependency declared in package.xml
+# 2. Install every ROS dependency declared in the package.xml files
 cd ~/ros2_ws
 sudo apt update
 rosdep install --from-paths src --ignore-src -y --rosdistro humble
@@ -137,7 +137,7 @@ pip3 install "torch>=2.2,<2.9" torchvision --index-url https://download.pytorch.
 pip3 install -r src/r_one/requirements.txt
 
 # 4. Build
-colcon build --symlink-install --packages-select r_one
+colcon build --symlink-install
 source install/setup.bash
 ```
 
@@ -152,7 +152,7 @@ For a GPU, skip the `--index-url` option in step 3 so pip installs the default C
 Starts Gazebo simulation, spawns the robot with differential drive controllers, boots the spatial perception node, and opens RViz2 with pre-configured 3D perception displays:
 
 ```bash
-ros2 launch r_one spatial_scene.launch.py
+ros2 launch r_one_bringup spatial_scene.launch.py
 ```
 
 #### Common Launch Arguments
@@ -163,7 +163,7 @@ ros2 launch r_one spatial_scene.launch.py
 | `gui` | `true` | Open the Gazebo window | `gui:=false` (runs `gzserver`) |
 | `publish_robot_tf` | `true` | Start `robot_state_publisher` | `publish_robot_tf:=false` (your robot already runs it) |
 | `rviz` | `true` | Launch RViz2 visualizer | `rviz:=false` |
-| `world` | `worlds/spatial_demo.world` | Gazebo world file (features walking human actor) | `world:=worlds/empty.world` |
+| `world` | `r_one_bringup/worlds/spatial_demo.world` | Gazebo world file (features walking human actor) | `world:=worlds/empty.world` |
 | `target_frame` | `odom` | Reference frame for world coordinates | `target_frame:=map` (with SLAM/Nav2) |
 | `depth_source` | `depth_image` in simulation, `lidar` with `sim:=false` | Depth sensor backend: `'lidar'` or `'depth_image'` | `depth_source:=lidar` |
 | `depth_topic` | `camera/depth/image_raw` | Depth image topic when depth_source is depth_image | `depth_topic:=camera/depth/image_raw` |
@@ -175,12 +175,12 @@ ros2 launch r_one spatial_scene.launch.py
 
 *Example: Fully headless simulation:*
 ```bash
-ros2 launch r_one spatial_scene.launch.py gui:=false rviz:=false
+ros2 launch r_one_bringup spatial_scene.launch.py gui:=false rviz:=false
 ```
 
 *Example: Perception only, on a robot that already publishes its sensors and `odom` transform (not yet tested on real hardware):*
 ```bash
-ros2 launch r_one spatial_scene.launch.py sim:=false rviz:=false target_frame:=odom
+ros2 launch r_one_bringup spatial_scene.launch.py sim:=false rviz:=false target_frame:=odom
 ```
 
 ---
@@ -190,11 +190,11 @@ ros2 launch r_one spatial_scene.launch.py sim:=false rviz:=false target_frame:=o
 Test the 3D perception pipeline instantly without Gazebo or robot hardware:
 
 ```bash
-# 1. Download sample demonstration bag (or record locally via ./scripts/record_sample_bag.sh)
-./scripts/download_sample_bag.sh
+# 1. Download sample demonstration bag (or record locally via ./r_one/scripts/record_sample_bag.sh)
+./r_one/scripts/download_sample_bag.sh
 
 # 2. Launch perception and RViz with clock-synchronized bag playback
-ros2 launch r_one spatial_bag_playback.launch.py bag_path:=sample_bags/sample_spatial_run
+ros2 launch r_one_bringup spatial_bag_playback.launch.py bag_path:=sample_bags/sample_spatial_run
 ```
 
 ---
@@ -303,7 +303,7 @@ ros2 topic echo /diagnostics
 - `on_cleanup`: also clears the world model and track history.
 
 > [!TIP]
-> **Autostart:** parameter `autostart: true` (default) triggers `configure` and `activate` on boot, so launching `ros2 launch r_one spatial_scene.launch.py` needs no manual lifecycle commands.
+> **Autostart:** parameter `autostart: true` (default) triggers `configure` and `activate` on boot, so launching `ros2 launch r_one_bringup spatial_scene.launch.py` needs no manual lifecycle commands.
 
 ```bash
 # Query current lifecycle state
@@ -389,11 +389,25 @@ ros2 run r_one spatial_vision_node --ros-args -r __ns:=/robot_1
 Run the test suite without launching Gazebo:
 
 ```bash
-colcon test --packages-select r_one && colcon test-result --verbose
+colcon test && colcon test-result --verbose
 ```
 
 > [!NOTE]
-> The unit tests import the real `r_one` modules. They cover startup validation, crash guards, launch arguments and the Kalman filter. They do not yet check detection accuracy or safety behaviour.
+> The unit tests import the real `r_one` modules. They cover startup validation, crash guards, launch arguments, the Kalman filter and the scoring tools. They do not yet check detection accuracy or safety behaviour.
+
+### Scoring a Run
+
+`tools/score_run.py` compares a run with the demo world's scripted actor positions. Bag playback writes the run log when you set `run_log_path`:
+
+```bash
+mkdir -p reports
+ros2 launch r_one_bringup spatial_bag_playback.launch.py \
+  rviz:=false loop:=false run_log_path:=$PWD/reports/run.jsonl
+# Press Ctrl+C after the bag finishes, then:
+python3 tools/score_run.py reports/run.jsonl --gates
+```
+
+The scorer needs only Python, and `--gates` exits with an error if any target is missed.
 
 ---
 

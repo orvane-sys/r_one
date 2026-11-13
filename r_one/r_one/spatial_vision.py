@@ -21,6 +21,7 @@ except Exception:
 from geometry_msgs.msg import Point, PointStamped
 import message_filters
 import numpy as np
+from r_one.run_log import RunLog
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -219,6 +220,7 @@ class SpatialVisionNode(LifecycleNode):
         self.declare_parameter('yolo_model', 'yolov8n.pt')
         self.declare_parameter('img_size', 320)
         self.declare_parameter('autostart', True)
+        self.declare_parameter('run_log_path', '')  # Empty turns the run log off
 
         self.target_frame = (
             self.get_parameter('target_frame').get_parameter_value().string_value
@@ -269,6 +271,10 @@ class SpatialVisionNode(LifecycleNode):
             error = validate_parameter(name, self.get_parameter(name).value)
             if error is not None:
                 raise ValueError(error)
+
+        self.run_log = RunLog(
+            self.get_parameter('run_log_path').get_parameter_value().string_value
+        )
 
         self.add_on_set_parameters_callback(self.parameters_callback)
 
@@ -623,6 +629,7 @@ class SpatialVisionNode(LifecycleNode):
             marker_array = MarkerArray()
             dynamic_costmap_points: List[Tuple[float, float, float]] = []
             detected_ids = set()
+            logged_tracks = []
 
             if VISION_MSGS_AVAILABLE and self.detection_3d_pub is not None:
                 detection_3d_array = Detection3DArray()
@@ -815,6 +822,19 @@ class SpatialVisionNode(LifecycleNode):
                                     proj_z,
                                 ))
 
+                    logged_tracks.append({
+                        'id': track_id,
+                        'class': obj_name,
+                        'score': score,
+                        'x': global_pt.x,
+                        'y': global_pt.y,
+                        'z': global_pt.z,
+                        'vx': vel_x,
+                        'vy': vel_y,
+                        'state': state,
+                        'box': [float(x1), float(y1), float(x2), float(y2)],
+                    })
+
                     # Append visualization markers
                     self.append_markers(
                         marker_array,
@@ -900,6 +920,8 @@ class SpatialVisionNode(LifecycleNode):
             self.cycle_times.append(cycle_dt)
             if len(self.cycle_times) > 30:
                 self.cycle_times.pop(0)
+
+            self.run_log.write_frame(current_time, cycle_dt, logged_tracks, self.world_model)
 
     def parameters_callback(self, params):
         # Check every value first so a multi-parameter set applies fully or not at all.
@@ -1052,6 +1074,7 @@ class SpatialVisionNode(LifecycleNode):
 
     def on_shutdown(self, state):
         self.get_logger().info("Lifecycle: on_shutdown called.")
+        self.run_log.close()
         if hasattr(super(), 'on_shutdown'):
             return super().on_shutdown(state)
         return TransitionCallbackReturn.SUCCESS
