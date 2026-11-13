@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    pkg_dir = get_package_share_directory('r_one')
+    pkg_dir = get_package_share_directory('r_one_bringup')
     rviz_config_path = os.path.join(pkg_dir, 'config', 'drive_bot.rviz')
 
     target_frame_arg = DeclareLaunchArgument(

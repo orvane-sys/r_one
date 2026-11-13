@@ -23,7 +23,7 @@ is_bag() {
 
 fail_with_hint() {
     echo "ERROR: $1" >&2
-    echo "You can record your own bag instead: ./scripts/record_sample_bag.sh" >&2
+    echo "You can record your own bag instead: ros2 run r_one record_sample_bag.sh" >&2
     exit 1
 }
 
@@ -76,4 +76,4 @@ fi
 
 mv "${TMP_DIR}/${BAG_NAME}" "${BAG_DIR}"
 
-echo "Ready. Run: ros2 launch r_one spatial_bag_playback.launch.py bag_path:=${BAG_DIR}"
+echo "Ready. Run: ros2 launch r_one_bringup spatial_bag_playback.launch.py bag_path:=${BAG_DIR}"

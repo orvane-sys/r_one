@@ -22,3 +22,6 @@ __pycache__/
 
 # Downloaded or recorded sample bags
 sample_bags/
+
+# Run logs and scores from tools/score_run.py
+reports/

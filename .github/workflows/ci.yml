@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint shell scripts
-        run: shellcheck -S warning scripts/*.sh docker/entrypoint.sh
+        run: shellcheck -S warning r_one/scripts/*.sh docker/entrypoint.sh
 
   build-and-test:
     runs-on: ubuntu-22.04
@@ -41,5 +41,6 @@ jobs:
       - name: Run colcon tests (unit, launch integration, lint)
         run: |
           docker run --rm -e ROS_LOCALHOST_ONLY=1 r_one:ci bash -c '
-            colcon test --packages-select r_one --event-handlers console_direct+ &&
-            colcon test-result --verbose'
+            colcon test --event-handlers console_direct+ &&
+            colcon test-result --verbose &&
+            ament_flake8 src/r_one/tools'

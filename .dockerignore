@@ -17,3 +17,4 @@ sample_bags/
 *.db3
 *.mcap
 *.pt
+reports/

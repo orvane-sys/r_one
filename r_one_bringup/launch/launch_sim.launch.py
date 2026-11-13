@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    package_name = 'r_one'
+    package_name = 'r_one_bringup'
 
     rsp = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([

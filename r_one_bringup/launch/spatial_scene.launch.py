@@ -15,14 +15,14 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    pkg_r_one = get_package_share_directory('r_one')
+    pkg_bringup = get_package_share_directory('r_one_bringup')
 
     # Default to the animated spatial perception demo world
-    default_world = os.path.join(pkg_r_one, 'worlds', 'spatial_demo.world')
+    default_world = os.path.join(pkg_bringup, 'worlds', 'spatial_demo.world')
     if not os.path.exists(default_world):
-        default_world = os.path.join(pkg_r_one, 'worlds', 'empty.world')
+        default_world = os.path.join(pkg_bringup, 'worlds', 'empty.world')
 
-    default_rviz_config = os.path.join(pkg_r_one, 'config', 'drive_bot.rviz')
+    default_rviz_config = os.path.join(pkg_bringup, 'config', 'drive_bot.rviz')
 
     # --- Launch Arguments ---
     sim_arg = DeclareLaunchArgument(
@@ -139,7 +139,7 @@ def generate_launch_description():
     # --- 1. Simulation Components (Optional) ---
     rsp_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            [os.path.join(pkg_r_one, 'launch', 'rsp.launch.py')]
+            [os.path.join(pkg_bringup, 'launch', 'rsp.launch.py')]
         ),
         launch_arguments={
             'use_sim_time': LaunchConfiguration('use_sim_time')

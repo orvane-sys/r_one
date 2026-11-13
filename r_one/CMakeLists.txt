@@ -30,8 +30,13 @@ if(BUILD_TESTING)
     ENV PYTHONNOUSERSITE=1
   )
 
-  # Regression tests for the crash and launch bugs. The launch files need the installed package.
+  # Regression tests for the crash bugs
   ament_add_pytest_test(guard_tests test/test_spatial_vision_guards.py
+    ENV PYTHONNOUSERSITE=1
+  )
+
+  # Tests for the run log and the scoring tools in the repository's tools/ folder
+  ament_add_pytest_test(scoring_tests test/test_scoring.py
     ENV PYTHONNOUSERSITE=1
   )
 
@@ -41,12 +46,6 @@ if(BUILD_TESTING)
     TIMEOUT 120
   )
 endif()
-
-# Install non-code asset directories
-install(
-  DIRECTORY config description launch worlds
-  DESTINATION share/${PROJECT_NAME}
-)
 
 # Install standard ROS 2 CLI executables (ros2 run r_one <node_name>)
 install(

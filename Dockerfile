@@ -21,10 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /home/ros/ros2_ws
 
-# ROS dependencies come from package.xml, so a missing declaration fails the build
-# here instead of failing at runtime. Only package.xml is copied at this point so this
-# layer stays cached while the source changes.
-COPY package.xml src/r_one/package.xml
+# ROS dependencies come from each package.xml, so a missing declaration fails the build
+# here instead of failing at runtime. Only package.xml files are copied at this point so
+# this layer stays cached while the source changes.
+COPY r_one/package.xml src/r_one/r_one/package.xml
+COPY r_one_bringup/package.xml src/r_one/r_one_bringup/package.xml
+COPY r_one_msgs/package.xml src/r_one/r_one_msgs/package.xml
 RUN apt-get update \
     && rosdep update --rosdistro humble \
     && rosdep install --from-paths src --ignore-src -y --rosdistro humble \
@@ -45,12 +47,12 @@ RUN /bin/bash -c "source /opt/ros/humble/setup.bash \
     && python3 -c \"import numpy, cv2; from cv_bridge import CvBridge; from ultralytics import YOLO; \
 assert numpy.__version__.startswith('1.'), numpy.__version__; print('perception imports OK, numpy', numpy.__version__)\""
 
-# Copy package source and build
+# Copy the repository and build every package in it
 COPY . src/r_one/
-RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build --symlink-install --packages-select r_one"
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build --symlink-install"
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["ros2", "launch", "r_one", "spatial_scene.launch.py"]
+CMD ["ros2", "launch", "r_one_bringup", "spatial_scene.launch.py"]

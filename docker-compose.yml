@@ -17,4 +17,4 @@ services:
       - TURTLEBOT3_MODEL=waffle
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-    command: ros2 launch r_one spatial_scene.launch.py
+    command: ros2 launch r_one_bringup spatial_scene.launch.py

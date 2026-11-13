@@ -1,33 +1,15 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>r_one</name>
+  <name>r_one_bringup</name>
   <version>0.1.0</version>
-  <description>ROS 2 Spatial Perception and 3D World Modeling with YOLO, LiDAR fusion, and TF2 tracking</description>
+  <description>Launch files, configuration, robot description and simulation worlds for r_one</description>
   <maintainer email="dev@orvane-sys.com">Orvane Systems</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
 
-  <!-- ROS interfaces and client library -->
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>rcl_interfaces</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>visualization_msgs</exec_depend>
-  <exec_depend>vision_msgs</exec_depend>
-  <exec_depend>diagnostic_msgs</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
-
-  <!-- Perception node -->
-  <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>message_filters</exec_depend>
-  <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>tf2_geometry_msgs</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-opencv</exec_depend>
-  <!-- ultralytics, lapx and torch are not in rosdep: see requirements.txt -->
+  <!-- Nodes started by the launch files -->
+  <exec_depend>r_one</exec_depend>
 
   <!-- Launch files and robot description -->
   <exec_depend>ament_index_python</exec_depend>
@@ -53,12 +35,8 @@
   <exec_depend>rosbag2_storage_mcap</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
-  <test_depend>ament_cmake_ros</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
-  <test_depend>launch_testing</test_depend>
-  <test_depend>launch_testing_ament_cmake</test_depend>
-  <test_depend>launch_testing_ros</test_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>python3-yaml</test_depend>
 

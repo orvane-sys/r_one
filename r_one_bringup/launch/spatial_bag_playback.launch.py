@@ -6,11 +6,12 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-    pkg_r_one = get_package_share_directory('r_one')
-    rviz_config = os.path.join(pkg_r_one, 'config', 'drive_bot.rviz')
+    pkg_bringup = get_package_share_directory('r_one_bringup')
+    rviz_config = os.path.join(pkg_bringup, 'config', 'drive_bot.rviz')
     # ros2 bag record writes a directory, so this names the directory, not a file
     default_bag = os.path.join(os.getcwd(), 'sample_bags', 'sample_spatial_run')
 
@@ -57,6 +58,12 @@ def generate_launch_description():
         description='Launch RViz2 visualizer',
     )
 
+    run_log_arg = DeclareLaunchArgument(
+        'run_log_path',
+        default_value='',
+        description='File for per-frame results that tools/score_run.py reads. Empty disables it',
+    )
+
     # Rosbag player process with simulation clock publishing
     play_cmd = [
         'ros2',
@@ -101,6 +108,9 @@ def generate_launch_description():
                 'yolo_model': 'yolov8n.pt',
                 'img_size': 320,
                 'use_sim_time': True,
+                'run_log_path': ParameterValue(
+                    LaunchConfiguration('run_log_path'), value_type=str
+                ),
             }
         ],
     )
@@ -124,6 +134,7 @@ def generate_launch_description():
         target_frame_arg,
         depth_source_arg,
         rviz_arg,
+        run_log_arg,
         bag_player,
         spatial_vision_node,
         rviz_node,
