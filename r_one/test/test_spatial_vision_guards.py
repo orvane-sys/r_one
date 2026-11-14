@@ -11,7 +11,8 @@ import rclpy
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import CameraInfo
 
-from r_one import spatial_vision
+from r_one import geometry, spatial_vision
+from r_one.detectors import ultralytics_detector
 from r_one.spatial_vision import (
     debug_window_supported,
     intrinsics_are_valid,
@@ -35,7 +36,7 @@ def fake_node(**overrides):
         cx=None,
         cy=None,
         bridge=mock.Mock(),
-        model=mock.Mock(),
+        detector=mock.Mock(),
         state_lock=threading.RLock(),
         frame_counter=0,
         process_every_n=1,
@@ -134,8 +135,8 @@ class TestNodeStartup(unittest.TestCase):
     def assert_startup_rejected(self, ros_argument):
         rclpy.init(args=['--ros-args', '-p', ros_argument])
         try:
-            with mock.patch.object(spatial_vision, 'YOLO', None), \
-                    mock.patch.object(spatial_vision, 'YOLO_AVAILABLE', False):
+            with mock.patch.object(ultralytics_detector, 'YOLO', None), \
+                    mock.patch.object(ultralytics_detector, 'YOLO_AVAILABLE', False):
                 with self.assertRaises(ValueError):
                     SpatialVisionNode()
         finally:
@@ -164,7 +165,7 @@ class TestFrameErrorHandling(unittest.TestCase):
     def test_inference_error_skips_the_frame(self):
         node = fake_node(fx=500.0, cx=320.0)
         node.bridge.imgmsg_to_cv2.return_value = np.zeros((4, 4, 3), dtype=np.uint8)
-        node.model.track.side_effect = RuntimeError('CUDA out of memory')
+        node.detector.detect.side_effect = RuntimeError('CUDA out of memory')
         self.frame(node)
         node.get_logger().error.assert_called_once()
 
@@ -173,7 +174,7 @@ class TestFrameErrorHandling(unittest.TestCase):
         node.bridge.imgmsg_to_cv2.side_effect = ValueError('bad encoding')
         self.frame(node)
         node.get_logger().error.assert_called_once()
-        node.model.track.assert_not_called()
+        node.detector.detect.assert_not_called()
 
 
 class TestDepthRanging(unittest.TestCase):
@@ -184,15 +185,15 @@ class TestDepthRanging(unittest.TestCase):
         self.image[:, 57:63] = 2.0
 
     def test_box_centre_between_the_legs_ranges_the_person(self):
-        distance = SpatialVisionNode.extract_depth_image_distance(
-            None, 50.0, 50.0, self.image, half_width=10.0, half_height=20.0
+        distance = geometry.extract_depth_image_distance(
+            50.0, 50.0, self.image, half_width=10.0, half_height=20.0
         )
         self.assertAlmostEqual(distance, 2.0)
 
     def test_invalid_depth_is_ignored(self):
         self.image[:, :] = np.inf
         self.assertIsNone(
-            SpatialVisionNode.extract_depth_image_distance(None, 50.0, 50.0, self.image)
+            geometry.extract_depth_image_distance(50.0, 50.0, self.image)
         )
 
 

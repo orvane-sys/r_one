@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import math
 import os
-import struct
 import sys
 import threading
 import time
@@ -18,9 +17,14 @@ except Exception:
     cv2 = None
     CvBridge = None
     CV_BRIDGE_AVAILABLE = False
-from geometry_msgs.msg import Point, PointStamped
 import message_filters
 import numpy as np
+from r_one import geometry, messages
+from r_one.detectors import ultralytics_detector
+from r_one.detectors.ultralytics_detector import resolve_model_path, UltralyticsDetector
+from r_one.geometry import intrinsics_are_valid
+from r_one.messages import Detection3DArray, VISION_MSGS_AVAILABLE
+from r_one.parameters import PARAMETER_RULES, validate_parameter
 from r_one.run_log import RunLog
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -32,35 +36,10 @@ except ImportError:
     from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
-from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud2
 from std_srvs.srv import Trigger
 import tf2_ros
 from visualization_msgs.msg import Marker, MarkerArray
-import tf2_geometry_msgs  # noqa: F401 - registers geometry_msgs methods for TF2
-_ = tf2_geometry_msgs
-
-try:
-    from ultralytics import YOLO
-
-    YOLO_AVAILABLE = True
-except Exception:
-    YOLO = None
-    YOLO_AVAILABLE = False
-
-# Optional import for vision_msgs to maintain compatibility on minimal systems
-try:
-    from vision_msgs.msg import (
-        Detection3D,
-        Detection3DArray,
-        ObjectHypothesisWithPose,
-    )
-
-    VISION_MSGS_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    VISION_MSGS_AVAILABLE = False
-    Detection3D = None
-    Detection3DArray = None
-    ObjectHypothesisWithPose = None
 
 # Optional import for diagnostic_msgs
 try:
@@ -86,65 +65,6 @@ except ImportError:
         SUCCESS = 0
         FAILURE = 1
         ERROR = 2
-
-
-def resolve_model_path(name: str) -> str:
-    """Prefer a weights file in $R_ONE_MODEL_DIR (set in the Docker image) over a download."""
-    model_dir = os.environ.get('R_ONE_MODEL_DIR')
-    if model_dir and not os.path.isabs(name):
-        candidate = os.path.join(model_dir, name)
-        if os.path.isfile(candidate):
-            return candidate
-    return name
-
-
-# name: (predicate, reason). NaN fails every predicate, so it is rejected too.
-PARAMETER_RULES = {
-    'speed_threshold': (
-        lambda value: value >= 0.0,
-        "speed_threshold must be non-negative",
-    ),
-    'process_every_n_frames': (
-        lambda value: value >= 1,
-        "process_every_n_frames must be >= 1",
-    ),
-    'img_size': (
-        lambda value: value >= 1,
-        "img_size must be >= 1",
-    ),
-    'sync_slop': (
-        lambda value: value > 0.0,
-        "sync_slop must be > 0.0",
-    ),
-    'ema_alpha': (
-        lambda value: 0.0 < value <= 1.0,
-        "ema_alpha must be in range (0.0, 1.0]",
-    ),
-    'tracking_filter': (
-        lambda value: str(value).lower() in ('ema', 'kalman'),
-        "tracking_filter must be 'ema' or 'kalman'",
-    ),
-    'depth_source': (
-        lambda value: value in ('lidar', 'depth_image'),
-        "depth_source must be 'lidar' or 'depth_image'",
-    ),
-}
-
-
-def validate_parameter(name: str, value) -> Optional[str]:
-    """Return why a parameter value is invalid, or None when it is fine."""
-    rule = PARAMETER_RULES.get(name)
-    if rule is None or rule[0](value):
-        return None
-    return rule[1]
-
-
-def intrinsics_are_valid(k) -> bool:
-    """Check a CameraInfo K matrix. Uncalibrated cameras often publish all zeros."""
-    fx, cx, fy, cy = k[0], k[2], k[4], k[5]
-    if not all(math.isfinite(value) for value in (fx, cx, fy, cy)):
-        return False
-    return fx > 0.0 and fy > 0.0
 
 
 def debug_window_supported() -> bool:
@@ -282,10 +202,10 @@ class SpatialVisionNode(LifecycleNode):
             f"Loading YOLO model ({yolo_path}) | Depth source: '{self.depth_source}' | "
             f"Tracker: '{self.tracking_filter}'..."
         )
-        if YOLO_AVAILABLE:
-            self.model = YOLO(yolo_path)
+        if ultralytics_detector.YOLO_AVAILABLE:
+            self.detector = UltralyticsDetector(yolo_path, self.img_size)
         else:
-            self.model = None
+            self.detector = None
             self.get_logger().error(
                 "YOLO failed to load (NumPy 2.x ABI incompatibility detected). "
                 "Fix by running: pip3 install 'numpy<2'"
@@ -453,100 +373,6 @@ class SpatialVisionNode(LifecycleNode):
                 f"cx={self.cx:.2f}, cy={self.cy:.2f}"
             )
 
-    def extract_lidar_distance(
-        self, angle_rad: float, scan: LaserScan
-    ) -> Optional[float]:
-        target_yaw = math.atan2(math.sin(angle_rad), math.cos(angle_rad))
-
-        if scan.angle_min >= 0.0 and target_yaw < 0.0:
-            target_yaw += 2.0 * math.pi
-
-        if target_yaw < scan.angle_min or target_yaw > scan.angle_max:
-            return None
-
-        idx = int(round((target_yaw - scan.angle_min) / scan.angle_increment))
-
-        window_ranges = []
-        for offset in range(-2, 3):
-            cur_idx = idx + offset
-            if 0 <= cur_idx < len(scan.ranges):
-                r = scan.ranges[cur_idx]
-                if (
-                    scan.range_min < r < scan.range_max
-                    and not math.isinf(r)
-                    and not math.isnan(r)
-                ):
-                    window_ranges.append(r)
-
-        if not window_ranges:
-            return None
-
-        window_ranges.sort()
-        return window_ranges[len(window_ranges) // 2]
-
-    def extract_depth_image_distance(
-        self,
-        u: float,
-        v: float,
-        depth_image: np.ndarray,
-        half_width: float = 2.0,
-        half_height: float = 2.0,
-    ) -> Optional[float]:
-        # Use the nearest quartile of the patch: the centre of a box can fall between a
-        # person's legs, so a reading there may hit the background.
-        h, w = depth_image.shape[:2]
-        ui, vi = int(round(u)), int(round(v))
-        if not (0 <= ui < w and 0 <= vi < h):
-            return None
-
-        half_u = max(2, int(half_width))
-        half_v = max(2, int(half_height))
-        u_min, u_max = max(0, ui - half_u), min(w, ui + half_u + 1)
-        v_min, v_max = max(0, vi - half_v), min(h, vi + half_v + 1)
-        window = depth_image[v_min:v_max, u_min:u_max]
-
-        valid_vals = window[
-            (window > 0.1) & (window < 10.0) & ~np.isnan(window) & ~np.isinf(window)
-        ]
-        if len(valid_vals) == 0:
-            return None
-        return float(np.percentile(valid_vals, 25))
-
-    def transform_point_to_target(
-        self,
-        local_x: float,
-        local_y: float,
-        local_z: float,
-        source_frame: str,
-        stamp,
-    ) -> Optional[Point]:
-        pt = PointStamped()
-        pt.header.frame_id = source_frame
-        pt.header.stamp = stamp
-        pt.point.x = local_x
-        pt.point.y = local_y
-        pt.point.z = local_z
-
-        try:
-            transformed = self.tf_buffer.transform(
-                pt, self.target_frame, timeout=Duration(seconds=0.05)
-            )
-            return transformed.point
-        except (
-            tf2_ros.LookupException,
-            tf2_ros.ExtrapolationException,
-            tf2_ros.ConnectivityException,
-        ):
-            try:
-                pt.header.stamp = rclpy.time.Time().to_msg()
-                transformed = self.tf_buffer.transform(
-                    pt, self.target_frame, timeout=Duration(seconds=0.05)
-                )
-                return transformed.point
-            except Exception as e:
-                self.get_logger().debug(f"TF transformation error: {e}")
-                return None
-
     def sync_lidar_callback(self, img_msg: Image, scan_msg: LaserScan):
         self.process_perception_frame(
             img_msg=img_msg,
@@ -597,20 +423,14 @@ class SpatialVisionNode(LifecycleNode):
         if self.fx is None or self.cx is None:
             return
 
-        if self.model is None or self.bridge is None:
+        if self.detector is None or self.bridge is None:
             return
 
         with self.state_lock:
             start_time = time.perf_counter()
             try:
                 cv_image = self.bridge.imgmsg_to_cv2(img_msg, 'bgr8')
-                results = self.model.track(
-                    cv_image,
-                    persist=True,
-                    tracker='bytetrack.yaml',
-                    imgsz=self.img_size,
-                    verbose=False,
-                )
+                detections = self.detector.detect(cv_image)
             except Exception as exc:
                 self.get_logger().error(
                     f"Skipping frame, detection failed: {exc}",
@@ -638,27 +458,23 @@ class SpatialVisionNode(LifecycleNode):
             else:
                 detection_3d_array = None
 
-            if len(results[0].boxes) > 0:
-                for box_idx, box in enumerate(results[0].boxes):
-                    class_id = int(box.cls[0])
-                    obj_name = self.model.names[class_id]
-                    score = float(box.conf[0])
-
-                    track_id = -1
-                    if box.id is not None:
-                        track_id = int(box.id[0])
+            if detections:
+                for box_idx, detection in enumerate(detections):
+                    obj_name = detection.class_name
+                    score = detection.score
+                    track_id = detection.track_id
 
                     base_marker_id = (
                         track_id if track_id != -1 else (10000 + box_idx)
                     )
 
-                    x1, y1, x2, y2 = box.xyxy[0]
+                    x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
                     u = float((x1 + x2) / 2)
                     v = float((y1 + y2) / 2)
 
                     if is_depth_image:
                         # Sample the middle third of the box
-                        distance = self.extract_depth_image_distance(
+                        distance = geometry.extract_depth_image_distance(
                             u,
                             v,
                             sensor_data,
@@ -683,7 +499,7 @@ class SpatialVisionNode(LifecycleNode):
                         )
                     else:
                         angle_rad = math.atan((self.cx - u) / self.fx)
-                        distance = self.extract_lidar_distance(
+                        distance = geometry.extract_lidar_distance(
                             angle_rad, sensor_data
                         )
                         if distance is None:
@@ -697,12 +513,15 @@ class SpatialVisionNode(LifecycleNode):
                             else 'laser_frame'
                         )
 
-                    global_pt = self.transform_point_to_target(
+                    global_pt = geometry.transform_point(
+                        self.tf_buffer,
+                        self.target_frame,
                         local_x,
                         local_y,
                         local_z,
                         source_frame,
                         stamp,
+                        self.get_logger(),
                     )
                     if global_pt is None:
                         continue
@@ -836,8 +655,9 @@ class SpatialVisionNode(LifecycleNode):
                     })
 
                     # Append visualization markers
-                    self.append_markers(
+                    messages.append_markers(
                         marker_array,
+                        self.target_frame,
                         base_marker_id,
                         track_id,
                         obj_name,
@@ -851,8 +671,9 @@ class SpatialVisionNode(LifecycleNode):
 
                     # Append standard 3D detections
                     if detection_3d_array is not None:
-                        self.append_detection_3d(
+                        messages.append_detection_3d(
                             detection_3d_array,
+                            self.target_frame,
                             track_id,
                             obj_name,
                             score,
@@ -886,13 +707,15 @@ class SpatialVisionNode(LifecycleNode):
                             self.object_history.pop(tid, None)
 
             if self.frame_counter % 20 == 0:
-                self.append_world_model_markers(marker_array, stamp)
+                messages.append_world_model_markers(
+                    marker_array, self.target_frame, self.world_model, stamp
+                )
 
             if marker_array.markers:
                 self.marker_pub.publish(marker_array)
 
             if dynamic_costmap_points:
-                cloud_msg = self.build_pointcloud2(
+                cloud_msg = messages.build_pointcloud2(
                     dynamic_costmap_points, self.target_frame, stamp
                 )
                 self.costmap_obstacle_pub.publish(cloud_msg)
@@ -910,7 +733,7 @@ class SpatialVisionNode(LifecycleNode):
                 )
 
             if self.show_debug_window:
-                annotated_frame = results[0].plot()
+                annotated_frame = self.detector.plot()
                 cv2.namedWindow("Robot's 3D Spatial Vision", cv2.WINDOW_NORMAL)
                 cv2.imshow("Robot's 3D Spatial Vision", annotated_frame)
                 cv2.waitKey(1)
@@ -1078,201 +901,6 @@ class SpatialVisionNode(LifecycleNode):
         if hasattr(super(), 'on_shutdown'):
             return super().on_shutdown(state)
         return TransitionCallbackReturn.SUCCESS
-
-    def build_pointcloud2(
-        self,
-        points: List[Tuple[float, float, float]],
-        frame_id: str,
-        stamp,
-    ) -> PointCloud2:
-        cloud = PointCloud2()
-        cloud.header.frame_id = frame_id
-        cloud.header.stamp = stamp
-        cloud.height = 1
-        cloud.width = len(points)
-        cloud.is_dense = True
-        cloud.is_bigendian = False
-
-        cloud.fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-        ]
-        cloud.point_step = 12
-        cloud.row_step = 12 * len(points)
-
-        buffer = bytearray()
-        for x, y, z in points:
-            buffer.extend(struct.pack('fff', float(x), float(y), float(z)))
-        cloud.data = bytes(buffer)
-        return cloud
-
-    def append_detection_3d(
-        self,
-        detection_array: Detection3DArray,
-        track_id: int,
-        obj_name: str,
-        score: float,
-        pt: Point,
-        stamp,
-    ):
-        det = Detection3D()
-        det.header.frame_id = self.target_frame
-        det.header.stamp = stamp
-        det.id = str(track_id) if track_id != -1 else ""
-
-        hyp = ObjectHypothesisWithPose()
-        hyp.hypothesis.class_id = obj_name
-        hyp.hypothesis.score = score
-        hyp.pose.pose.position.x = pt.x
-        hyp.pose.pose.position.y = pt.y
-        hyp.pose.pose.position.z = pt.z + 0.25
-        hyp.pose.pose.orientation.w = 1.0
-        det.results.append(hyp)
-
-        det.bbox.center.position.x = pt.x
-        det.bbox.center.position.y = pt.y
-        det.bbox.center.position.z = pt.z + 0.25
-        det.bbox.center.orientation.w = 1.0
-        det.bbox.size.x = 0.45
-        det.bbox.size.y = 0.45
-        det.bbox.size.z = 0.50
-
-        detection_array.detections.append(det)
-
-    def append_markers(
-        self,
-        marker_array: MarkerArray,
-        base_marker_id: int,
-        track_id: int,
-        obj_name: str,
-        state: str,
-        pt: Point,
-        velocity: float,
-        vel_x: float,
-        vel_y: float,
-        stamp,
-    ):
-        base_id = base_marker_id
-
-        cube = Marker()
-        cube.header.frame_id = self.target_frame
-        cube.header.stamp = stamp
-        cube.ns = 'detected_objects'
-        cube.id = base_id
-        cube.type = Marker.CUBE
-        cube.action = Marker.ADD
-        cube.pose.position.x = pt.x
-        cube.pose.position.y = pt.y
-        cube.pose.position.z = pt.z + 0.25
-        cube.pose.orientation.w = 1.0
-        cube.scale.x = 0.45
-        cube.scale.y = 0.45
-        cube.scale.z = 0.50
-        cube.lifetime = Duration(seconds=0.6).to_msg()
-
-        if state == 'DYNAMIC':
-            cube.color.r = 1.0
-            cube.color.g = 0.3
-            cube.color.b = 0.1
-            cube.color.a = 0.65
-        else:
-            cube.color.r = 0.1
-            cube.color.g = 0.85
-            cube.color.b = 0.2
-            cube.color.a = 0.65
-        marker_array.markers.append(cube)
-
-        text = Marker()
-        text.header.frame_id = self.target_frame
-        text.header.stamp = stamp
-        text.ns = 'object_labels'
-        text.id = base_id
-        text.type = Marker.TEXT_VIEW_FACING
-        text.action = Marker.ADD
-        text.pose.position.x = pt.x
-        text.pose.position.y = pt.y
-        text.pose.position.z = pt.z + 0.65
-        text.scale.z = 0.18
-        text.color.r = 1.0
-        text.color.g = 1.0
-        text.color.b = 1.0
-        text.color.a = 1.0
-        text.text = f"[{obj_name.upper()}] ID:{track_id}\n{velocity:.2f} m/s ({state})"
-        text.lifetime = Duration(seconds=0.6).to_msg()
-        marker_array.markers.append(text)
-
-        if state == 'DYNAMIC' and velocity > 0.05:
-            arrow = Marker()
-            arrow.header.frame_id = self.target_frame
-            arrow.header.stamp = stamp
-            arrow.ns = 'velocity_vectors'
-            arrow.id = base_id
-            arrow.type = Marker.ARROW
-            arrow.action = Marker.ADD
-            arrow.scale.x = 0.04
-            arrow.scale.y = 0.08
-            arrow.scale.z = 0.08
-            arrow.color.r = 1.0
-            arrow.color.g = 0.9
-            arrow.color.b = 0.0
-            arrow.color.a = 0.9
-            arrow.lifetime = Duration(seconds=0.6).to_msg()
-
-            p_start = Point(x=pt.x, y=pt.y, z=pt.z + 0.25)
-            p_end = Point(
-                x=pt.x + vel_x * 0.7, y=pt.y + vel_y * 0.7, z=pt.z + 0.25
-            )
-            arrow.points = [p_start, p_end]
-            marker_array.markers.append(arrow)
-
-            # 4. Lookahead Trajectory Path (Line Strip)
-            traj = Marker()
-            traj.header.frame_id = self.target_frame
-            traj.header.stamp = stamp
-            traj.ns = 'predicted_trajectories'
-            traj.id = base_id
-            traj.type = Marker.LINE_STRIP
-            traj.action = Marker.ADD
-            traj.scale.x = 0.04
-            traj.color.r = 1.0
-            traj.color.g = 0.8
-            traj.color.b = 0.0
-            traj.color.a = 0.8
-            traj.lifetime = Duration(seconds=0.6).to_msg()
-            traj.points.append(Point(x=pt.x, y=pt.y, z=pt.z + 0.25))
-            for t_ahead in [0.5, 1.0, 1.5, 2.0]:
-                traj.points.append(Point(
-                    x=pt.x + vel_x * t_ahead,
-                    y=pt.y + vel_y * t_ahead,
-                    z=pt.z + 0.25
-                ))
-            marker_array.markers.append(traj)
-
-    def append_world_model_markers(self, marker_array: MarkerArray, stamp):
-        for idx, (name_key, (wx, wy, wz)) in enumerate(
-            self.world_model.items()
-        ):
-            wm_marker = Marker()
-            wm_marker.header.frame_id = self.target_frame
-            wm_marker.header.stamp = stamp
-            wm_marker.ns = 'world_model_memory'
-            wm_marker.id = idx
-            wm_marker.type = Marker.CYLINDER
-            wm_marker.action = Marker.ADD
-            wm_marker.pose.position.x = wx
-            wm_marker.pose.position.y = wy
-            wm_marker.pose.position.z = wz + 0.15
-            wm_marker.pose.orientation.w = 1.0
-            wm_marker.scale.x = 0.35
-            wm_marker.scale.y = 0.35
-            wm_marker.scale.z = 0.30
-            wm_marker.color.r = 0.2
-            wm_marker.color.g = 0.6
-            wm_marker.color.b = 1.0
-            wm_marker.color.a = 0.45
-            wm_marker.lifetime = Duration(seconds=2.0).to_msg()
-            marker_array.markers.append(wm_marker)
 
 
 def main(args=None):

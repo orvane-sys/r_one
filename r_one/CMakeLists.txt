@@ -35,6 +35,11 @@ if(BUILD_TESTING)
     ENV PYTHONNOUSERSITE=1
   )
 
+  # Tests for the modules split out of spatial_vision (geometry, messages, detectors)
+  ament_add_pytest_test(modules_tests test/test_modules.py
+    ENV PYTHONNOUSERSITE=1
+  )
+
   # Tests for the run log and the scoring tools in the repository's tools/ folder
   ament_add_pytest_test(scoring_tests test/test_scoring.py
     ENV PYTHONNOUSERSITE=1
