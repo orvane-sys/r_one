@@ -82,18 +82,6 @@ def generate_launch_description():
         description='Depth image topic name when depth_source is set to depth_image',
     )
 
-    tracking_filter_arg = DeclareLaunchArgument(
-        'tracking_filter',
-        default_value='ema',
-        description="Position and velocity filter: 'ema' or 'kalman'",
-    )
-
-    ema_alpha_arg = DeclareLaunchArgument(
-        'ema_alpha',
-        default_value='0.35',
-        description='EMA smoothing weight in (0.0, 1.0], used when tracking_filter is ema',
-    )
-
     speed_threshold_arg = DeclareLaunchArgument(
         'speed_threshold',
         default_value='0.15',
@@ -222,8 +210,6 @@ def generate_launch_description():
                 'target_frame': LaunchConfiguration('target_frame'),
                 'depth_source': LaunchConfiguration('depth_source'),
                 'depth_topic': LaunchConfiguration('depth_topic'),
-                'tracking_filter': LaunchConfiguration('tracking_filter'),
-                'ema_alpha': LaunchConfiguration('ema_alpha'),
                 'speed_threshold': LaunchConfiguration('speed_threshold'),
                 'sync_slop': LaunchConfiguration('sync_slop'),
                 'process_every_n_frames': LaunchConfiguration(
@@ -257,8 +243,6 @@ def generate_launch_description():
         target_frame_arg,
         depth_source_arg,
         depth_topic_arg,
-        tracking_filter_arg,
-        ema_alpha_arg,
         speed_threshold_arg,
         sync_slop_arg,
         process_every_n_arg,

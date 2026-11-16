@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import os
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import cv2
@@ -17,6 +18,7 @@ except Exception:
     cv2 = None
     CvBridge = None
     CV_BRIDGE_AVAILABLE = False
+from geometry_msgs.msg import Point
 import message_filters
 import numpy as np
 from r_one import geometry, messages
@@ -25,7 +27,9 @@ from r_one.detectors.ultralytics_detector import resolve_model_path, Ultralytics
 from r_one.geometry import intrinsics_are_valid
 from r_one.messages import Detection3DArray, VISION_MSGS_AVAILABLE
 from r_one.parameters import PARAMETER_RULES, validate_parameter
-from r_one.run_log import RunLog
+from r_one.run_log import RunLog, track_record
+from r_one.tracking import DYNAMIC, Measurement, Track, Tracker, TrackerConfig
+from r_one.world_model import WorldModel
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -73,44 +77,23 @@ def debug_window_supported() -> bool:
     return cv2 is not None and bool(has_display)
 
 
-class KalmanTracker2D:
-    def __init__(self, init_x: float, init_y: float):
-        self.x = np.array([init_x, init_y, 0.0, 0.0], dtype=np.float64)
-        self.P = np.diag([0.1, 0.1, 1.0, 1.0])
-        self.Q = np.diag([0.01, 0.01, 0.05, 0.05])
-        self.R = np.diag([0.04, 0.04])
-        self.H = np.array(
-            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float64
-        )
-        self.missed_frames = 0
-
-    def predict(self, dt: float) -> Tuple[float, float, float, float]:
-        F = np.array(
-            [
-                [1.0, 0.0, dt, 0.0],
-                [0.0, 1.0, 0.0, dt],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        )
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + self.Q
-        self.missed_frames += 1
-        return float(self.x[0]), float(self.x[1]), float(self.x[2]), float(self.x[3])
-
-    def update(
-        self, meas_x: float, meas_y: float
-    ) -> Tuple[float, float, float, float]:
-        z = np.array([meas_x, meas_y], dtype=np.float64)
-        y = z - (self.H @ self.x)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + (K @ y)
-        eye4 = np.eye(4, dtype=np.float64)
-        self.P = (eye4 - K @ self.H) @ self.P
-        self.missed_frames = 0
-        return float(self.x[0]), float(self.x[1]), float(self.x[2]), float(self.x[3])
+def predicted_path_points(track: Track) -> List[Tuple[float, float, float]]:
+    """Return costmap points along a moving track's path, 0.5 to 2 s ahead."""
+    x, y, z = track.position
+    vel_x, vel_y = track.velocity
+    points = []
+    for t_ahead in (0.5, 1.0, 1.5, 2.0):
+        proj_x = x + vel_x * t_ahead
+        proj_y = y + vel_y * t_ahead
+        points.append((proj_x, proj_y, z))
+        for a_idx in range(8):
+            ang = a_idx * (2.0 * math.pi / 8.0)
+            points.append((
+                proj_x + 0.25 * math.cos(ang),
+                proj_y + 0.25 * math.sin(ang),
+                z,
+            ))
+    return points
 
 
 class SpatialVisionNode(LifecycleNode):
@@ -132,8 +115,6 @@ class SpatialVisionNode(LifecycleNode):
         self.declare_parameter('depth_source', 'lidar')  # 'lidar' or 'depth_image'
         self.declare_parameter('depth_topic', 'camera/depth/image_raw')
         self.declare_parameter('speed_threshold', 0.15)
-        self.declare_parameter('ema_alpha', 0.35)
-        self.declare_parameter('tracking_filter', 'ema')  # 'ema' or 'kalman'
         self.declare_parameter('sync_slop', 0.08)
         self.declare_parameter('process_every_n_frames', 5)
         self.declare_parameter('show_debug_window', False)
@@ -155,14 +136,6 @@ class SpatialVisionNode(LifecycleNode):
             self.get_parameter('speed_threshold')
             .get_parameter_value()
             .double_value
-        )
-        self.ema_alpha = (
-            self.get_parameter('ema_alpha').get_parameter_value().double_value
-        )
-        self.tracking_filter = (
-            self.get_parameter('tracking_filter')
-            .get_parameter_value()
-            .string_value.lower()
         )
         self.sync_slop = (
             self.get_parameter('sync_slop').get_parameter_value().double_value
@@ -199,8 +172,7 @@ class SpatialVisionNode(LifecycleNode):
         self.add_on_set_parameters_callback(self.parameters_callback)
 
         self.get_logger().info(
-            f"Loading YOLO model ({yolo_path}) | Depth source: '{self.depth_source}' | "
-            f"Tracker: '{self.tracking_filter}'..."
+            f"Loading YOLO model ({yolo_path}) | Depth source: '{self.depth_source}'..."
         )
         if ultralytics_detector.YOLO_AVAILABLE:
             self.detector = UltralyticsDetector(yolo_path, self.img_size)
@@ -336,10 +308,11 @@ class SpatialVisionNode(LifecycleNode):
             self.diag_pub = None
             self.diag_timer = None
 
-        # --- Kinematics & Memory Buffers ---
-        self.object_history: Dict[int, Tuple[float, ...]] = {}
-        self.kalman_trackers: Dict[int, KalmanTracker2D] = {}
-        self.world_model: Dict[str, Tuple[float, float, float]] = {}
+        # --- Tracker & Memory ---
+        self.tracker = Tracker(TrackerConfig(speed_threshold_mps=self.speed_threshold))
+        self.world_model = WorldModel()
+        # World-model markers drawn last frame, so entries that leave get deleted.
+        self.world_marker_count = 0
 
         self.frame_counter = 0
 
@@ -446,11 +419,6 @@ class SpatialVisionNode(LifecycleNode):
             else:
                 current_time = now_sec
 
-            marker_array = MarkerArray()
-            dynamic_costmap_points: List[Tuple[float, float, float]] = []
-            detected_ids = set()
-            logged_tracks = []
-
             if VISION_MSGS_AVAILABLE and self.detection_3d_pub is not None:
                 detection_3d_array = Detection3DArray()
                 detection_3d_array.header.frame_id = self.target_frame
@@ -458,258 +426,125 @@ class SpatialVisionNode(LifecycleNode):
             else:
                 detection_3d_array = None
 
-            if detections:
-                for box_idx, detection in enumerate(detections):
-                    obj_name = detection.class_name
-                    score = detection.score
-                    track_id = detection.track_id
+            measurements: List[Measurement] = []
+            for detection in detections:
+                x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
+                u = float((x1 + x2) / 2)
+                v = float((y1 + y2) / 2)
 
-                    base_marker_id = (
-                        track_id if track_id != -1 else (10000 + box_idx)
+                if is_depth_image:
+                    # Sample the middle third of the box
+                    distance = geometry.extract_depth_image_distance(
+                        u,
+                        v,
+                        sensor_data,
+                        half_width=float(x2 - x1) / 6.0,
+                        half_height=float(y2 - y1) / 6.0,
                     )
-
-                    x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
-                    u = float((x1 + x2) / 2)
-                    v = float((y1 + y2) / 2)
-
-                    if is_depth_image:
-                        # Sample the middle third of the box
-                        distance = geometry.extract_depth_image_distance(
-                            u,
-                            v,
-                            sensor_data,
-                            half_width=float(x2 - x1) / 6.0,
-                            half_height=float(y2 - y1) / 6.0,
-                        )
-                        if distance is None:
-                            continue
-                        fy = self.fy if self.fy is not None else self.fx
-                        cy = (
-                            self.cy
-                            if self.cy is not None
-                            else (cv_image.shape[0] / 2.0)
-                        )
-                        local_x = (u - self.cx) * distance / self.fx
-                        local_y = (v - cy) * distance / fy
-                        local_z = distance
-                        source_frame = (
-                            depth_frame_id
-                            if depth_frame_id
-                            else 'camera_optical_link'
-                        )
-                    else:
-                        angle_rad = math.atan((self.cx - u) / self.fx)
-                        distance = geometry.extract_lidar_distance(
-                            angle_rad, sensor_data
-                        )
-                        if distance is None:
-                            continue
-                        local_x = distance * math.cos(angle_rad)
-                        local_y = distance * math.sin(angle_rad)
-                        local_z = 0.0
-                        source_frame = (
-                            sensor_data.header.frame_id
-                            if sensor_data.header.frame_id
-                            else 'laser_frame'
-                        )
-
-                    global_pt = geometry.transform_point(
-                        self.tf_buffer,
-                        self.target_frame,
-                        local_x,
-                        local_y,
-                        local_z,
-                        source_frame,
-                        stamp,
-                        self.get_logger(),
-                    )
-                    if global_pt is None:
+                    if distance is None:
                         continue
-
-                    velocity = 0.0
-                    vel_x = 0.0
-                    vel_y = 0.0
-
-                    if track_id != -1:
-                        detected_ids.add(track_id)
-                        if self.tracking_filter == 'kalman':
-                            if track_id not in self.kalman_trackers:
-                                self.kalman_trackers[track_id] = KalmanTracker2D(
-                                    global_pt.x, global_pt.y
-                                )
-                            else:
-                                prev_t = (
-                                    self.object_history[track_id][3]
-                                    if track_id in self.object_history
-                                    else current_time - 0.08
-                                )
-                                dt = max(0.01, min(current_time - prev_t, 0.5))
-                                self.kalman_trackers[track_id].predict(dt)
-                                _, _, vel_x, vel_y = self.kalman_trackers[
-                                    track_id
-                                ].update(global_pt.x, global_pt.y)
-                                velocity = math.sqrt(vel_x**2 + vel_y**2)
-
-                            self.object_history[track_id] = (
-                                global_pt.x,
-                                global_pt.y,
-                                global_pt.z,
-                                current_time,
-                                vel_x,
-                                vel_y,
-                            )
-                        else:
-                            # EMA Velocity Smoothing
-                            if track_id in self.object_history:
-                                hist_entry = self.object_history[track_id]
-                                prev_x = hist_entry[0]
-                                prev_y = hist_entry[1]
-                                prev_time = hist_entry[3]
-                                prev_vx = (
-                                    hist_entry[4]
-                                    if len(hist_entry) > 4
-                                    else 0.0
-                                )
-                                prev_vy = (
-                                    hist_entry[5]
-                                    if len(hist_entry) > 5
-                                    else 0.0
-                                )
-                                has_prev_vel = len(hist_entry) > 4
-
-                                dt = current_time - prev_time
-                                if dt > 0.05:
-                                    raw_vx = (global_pt.x - prev_x) / dt
-                                    raw_vy = (global_pt.y - prev_y) / dt
-
-                                    if has_prev_vel:
-                                        vel_x = (
-                                            self.ema_alpha * raw_vx
-                                            + (1.0 - self.ema_alpha) * prev_vx
-                                        )
-                                        vel_y = (
-                                            self.ema_alpha * raw_vy
-                                            + (1.0 - self.ema_alpha) * prev_vy
-                                        )
-                                    else:
-                                        vel_x = raw_vx
-                                        vel_y = raw_vy
-
-                                    velocity = math.sqrt(vel_x**2 + vel_y**2)
-                                elif has_prev_vel:
-                                    vel_x = prev_vx
-                                    vel_y = prev_vy
-                                    velocity = math.sqrt(vel_x**2 + vel_y**2)
-
-                            self.object_history[track_id] = (
-                                global_pt.x,
-                                global_pt.y,
-                                global_pt.z,
-                                current_time,
-                                vel_x,
-                                vel_y,
-                            )
-
-                    state = (
-                        'DYNAMIC'
-                        if velocity > self.speed_threshold
-                        else 'STATIC'
+                    local_x = (u - self.cx) * distance / self.fx
+                    local_y = (v - self.cy) * distance / self.fy
+                    local_z = distance
+                    source_frame = (
+                        depth_frame_id
+                        if depth_frame_id
+                        else 'camera_optical_link'
+                    )
+                else:
+                    angle_rad = math.atan((self.cx - u) / self.fx)
+                    distance = geometry.extract_lidar_distance(
+                        angle_rad, sensor_data
+                    )
+                    if distance is None:
+                        continue
+                    local_x = distance * math.cos(angle_rad)
+                    local_y = distance * math.sin(angle_rad)
+                    local_z = 0.0
+                    source_frame = (
+                        sensor_data.header.frame_id
+                        if sensor_data.header.frame_id
+                        else 'laser_frame'
                     )
 
-                    if state == 'STATIC' and track_id != -1:
-                        self.world_model[f'{obj_name}_{track_id}'] = (
-                            global_pt.x,
-                            global_pt.y,
-                            global_pt.z,
-                        )
-                    elif state == 'DYNAMIC' and track_id != -1:
-                        self.world_model.pop(f'{obj_name}_{track_id}', None)
+                global_pt = geometry.transform_point(
+                    self.tf_buffer,
+                    self.target_frame,
+                    local_x,
+                    local_y,
+                    local_z,
+                    source_frame,
+                    stamp,
+                    self.get_logger(),
+                )
+                if global_pt is None:
+                    continue
 
-                        # Dynamic Costmap Injection
-                        for t_ahead in [0.5, 1.0, 1.5, 2.0]:
-                            proj_x = global_pt.x + vel_x * t_ahead
-                            proj_y = global_pt.y + vel_y * t_ahead
-                            proj_z = global_pt.z
-                            dynamic_costmap_points.append(
-                                (proj_x, proj_y, proj_z)
-                            )
-                            for a_idx in range(8):
-                                ang = a_idx * (2.0 * math.pi / 8.0)
-                                dynamic_costmap_points.append((
-                                    proj_x + 0.25 * math.cos(ang),
-                                    proj_y + 0.25 * math.sin(ang),
-                                    proj_z,
-                                ))
+                measurements.append(Measurement(
+                    global_pt.x,
+                    global_pt.y,
+                    global_pt.z,
+                    detection.class_name,
+                    detection.score,
+                    (float(x1), float(y1), float(x2), float(y2)),
+                ))
 
-                    logged_tracks.append({
-                        'id': track_id,
-                        'class': obj_name,
-                        'score': score,
-                        'x': global_pt.x,
-                        'y': global_pt.y,
-                        'z': global_pt.z,
-                        'vx': vel_x,
-                        'vy': vel_y,
-                        'state': state,
-                        'box': [float(x1), float(y1), float(x2), float(y2)],
-                    })
+            tracks = self.tracker.step(current_time, measurements)
+            for track in tracks:
+                self.world_model.observe(track, current_time)
 
-                    # Append visualization markers
-                    messages.append_markers(
-                        marker_array,
+            marker_array = MarkerArray()
+            for track in tracks:
+                x, y, z = track.position
+                vel_x, vel_y = track.velocity
+                point = Point(x=x, y=y, z=z)
+                messages.append_markers(
+                    marker_array,
+                    self.target_frame,
+                    track.id,
+                    track.id,
+                    track.class_name,
+                    track.motion,
+                    point,
+                    track.speed,
+                    vel_x,
+                    vel_y,
+                    stamp,
+                )
+                if detection_3d_array is not None:
+                    messages.append_detection_3d(
+                        detection_3d_array,
                         self.target_frame,
-                        base_marker_id,
-                        track_id,
-                        obj_name,
-                        state,
-                        global_pt,
-                        velocity,
-                        vel_x,
-                        vel_y,
+                        track.id,
+                        track.class_name,
+                        track.measurement.score,
+                        point,
                         stamp,
                     )
-
-                    # Append standard 3D detections
-                    if detection_3d_array is not None:
-                        messages.append_detection_3d(
-                            detection_3d_array,
-                            self.target_frame,
-                            track_id,
-                            obj_name,
-                            score,
-                            global_pt,
-                            stamp,
-                        )
-
-                    self.get_logger().info(
-                        f"[{state}] ID:{track_id} {obj_name.upper()} | "
-                        f"Global X:{global_pt.x:.2f}m Y:{global_pt.y:.2f}m | "
-                        f"Speed: {velocity:.2f} m/s"
-                    )
-
-            # Kalman Occlusion Coasting for tracks temporarily lost
-            if self.tracking_filter == 'kalman':
-                for tid, tracker in list(self.kalman_trackers.items()):
-                    if tid not in detected_ids:
-                        if tracker.missed_frames <= 3:
-                            dt = 0.08
-                            cx, cy, cvx, cvy = tracker.predict(dt)
-                            c_vel = math.sqrt(cvx**2 + cvy**2)
-                            if c_vel > self.speed_threshold:
-                                for t_ahead in [0.5, 1.0, 1.5, 2.0]:
-                                    proj_x = cx + cvx * t_ahead
-                                    proj_y = cy + cvy * t_ahead
-                                    dynamic_costmap_points.append(
-                                        (proj_x, proj_y, 0.0)
-                                    )
-                        else:
-                            del self.kalman_trackers[tid]
-                            self.object_history.pop(tid, None)
-
-            if self.frame_counter % 20 == 0:
-                messages.append_world_model_markers(
-                    marker_array, self.target_frame, self.world_model, stamp
+                self.get_logger().debug(
+                    f"[{track.motion}] ID:{track.id} {track.class_name.upper()} | "
+                    f"Global X:{x:.2f}m Y:{y:.2f}m | Speed: {track.speed:.2f} m/s"
                 )
+
+            # Moving tracks feed the costmap while they coast through a short occlusion too.
+            dynamic_costmap_points: List[Tuple[float, float, float]] = []
+            for track in tracks + self.tracker.coasting_dynamic():
+                if track.motion == DYNAMIC:
+                    dynamic_costmap_points.extend(predicted_path_points(track))
+
+            for namespace in messages.TRACK_MARKER_NAMESPACES:
+                messages.append_delete_markers(
+                    marker_array, self.target_frame, namespace,
+                    self.tracker.ended_ids(), stamp,
+                )
+            messages.append_world_model_markers(
+                marker_array, self.target_frame, self.world_model, stamp
+            )
+            messages.append_delete_markers(
+                marker_array, self.target_frame, messages.WORLD_MODEL_NAMESPACE,
+                range(len(self.world_model), self.world_marker_count), stamp,
+            )
+            self.world_marker_count = len(self.world_model)
 
             if marker_array.markers:
                 self.marker_pub.publish(marker_array)
@@ -744,7 +579,10 @@ class SpatialVisionNode(LifecycleNode):
             if len(self.cycle_times) > 30:
                 self.cycle_times.pop(0)
 
-            self.run_log.write_frame(current_time, cycle_dt, logged_tracks, self.world_model)
+            self.run_log.write_frame(
+                current_time, cycle_dt, [track_record(track) for track in tracks],
+                self.world_model,
+            )
 
     def parameters_callback(self, params):
         # Check every value first so a multi-parameter set applies fully or not at all.
@@ -756,6 +594,9 @@ class SpatialVisionNode(LifecycleNode):
         for param in params:
             if param.name == 'speed_threshold':
                 self.speed_threshold = float(param.value)
+                self.tracker.config = replace(
+                    self.tracker.config, speed_threshold_mps=self.speed_threshold
+                )
                 self.get_logger().info(
                     f"Dynamic reconfigure: speed_threshold set to {self.speed_threshold:.2f} m/s"
                 )
@@ -770,16 +611,6 @@ class SpatialVisionNode(LifecycleNode):
                     self.time_sync.slop = Duration(seconds=self.sync_slop)
                 self.get_logger().info(
                     f"Dynamic reconfigure: sync_slop set to {self.sync_slop:.3f} s"
-                )
-            elif param.name == 'ema_alpha':
-                self.ema_alpha = float(param.value)
-                self.get_logger().info(
-                    f"Dynamic reconfigure: ema_alpha set to {self.ema_alpha:.2f}"
-                )
-            elif param.name == 'tracking_filter':
-                self.tracking_filter = str(param.value).lower()
-                self.get_logger().info(
-                    f"Dynamic reconfigure: tracking_filter set to {self.tracking_filter}"
                 )
             elif param.name == 'show_debug_window':
                 self.show_debug_window = bool(param.value)
@@ -822,17 +653,15 @@ class SpatialVisionNode(LifecycleNode):
                     key="latency_ms", value=f"{self.last_inference_latency:.2f}"
                 ),
                 KeyValue(
-                    key="active_tracks", value=str(len(self.object_history))
+                    key="active_tracks", value=str(len(self.tracker.tracks))
                 ),
                 KeyValue(
                     key="world_model_objects", value=str(len(self.world_model))
                 ),
                 KeyValue(key="depth_source", value=self.depth_source),
-                KeyValue(key="tracking_filter", value=self.tracking_filter),
                 KeyValue(
                     key="speed_threshold", value=f"{self.speed_threshold:.2f}"
                 ),
-                KeyValue(key="ema_alpha", value=f"{self.ema_alpha:.2f}"),
                 KeyValue(
                     key="sync_delta_ms", value=f"{self.last_sync_delta_ms:.2f}"
                 ),
@@ -860,8 +689,7 @@ class SpatialVisionNode(LifecycleNode):
 
     def handle_reset_tracker(self, request, response):
         with self.state_lock:
-            self.object_history.clear()
-            self.kalman_trackers.clear()
+            self.tracker.reset()
             self.get_logger().info(
                 "Perception tracker state reset via service."
             )
@@ -889,8 +717,7 @@ class SpatialVisionNode(LifecycleNode):
         self.get_logger().info("Lifecycle: on_cleanup called.")
         with self.state_lock:
             self.world_model.clear()
-            self.object_history.clear()
-            self.kalman_trackers.clear()
+            self.tracker.reset()
         if hasattr(super(), 'on_cleanup'):
             return super().on_cleanup(state)
         return TransitionCallbackReturn.SUCCESS

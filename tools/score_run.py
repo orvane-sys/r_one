@@ -30,6 +30,8 @@ OFFSET_STEP_S = 0.05
 EXPECTED_OFFSET_S = 0.5
 # Velocity right after a turn is excluded from the cruise figure.
 TURN_SETTLE_S = 1.0
+# Resolution when searching back for the moment the walker started moving.
+MOVEMENT_STEP_S = 0.01
 ID_SWITCH_WINDOW_S = 100.0
 
 # metric, comparison, target. These match the plan's measured gates.
@@ -125,15 +127,40 @@ def count_id_switches(ids):
     return sum(1 for before, after in zip(known, known[1:]) if before != after)
 
 
-def time_to_dynamic(walker_matches):
-    """Return the slowest first-seen to DYNAMIC delay across the walker's track IDs."""
+def is_moving(walker, script_time):
+    _, _, vx, vy = walker.state_at(script_time)
+    return math.hypot(vx, vy) > 0.0
+
+
+def movement_start(walker, script_time):
+    """Return the script time at which the walker last started moving, up to script_time."""
+    # The script starts at its delay, and one period back is as far as there is to search
+    limit = max(script_time - walker.period, walker.delay)
+    start = script_time
+    while start > limit and not is_moving(walker, start):
+        start -= MOVEMENT_STEP_S
+    while start > limit and is_moving(walker, start - MOVEMENT_STEP_S):
+        start -= MOVEMENT_STEP_S
+    return start
+
+
+def time_to_dynamic(walker_matches, walker, time_offset):
+    """
+    Return the slowest delay before DYNAMIC across the walker's track IDs.
+
+    Each delay counts from when the ID was first seen or from when the walker last started
+    moving, whichever is later, because a tracker cannot see motion during a pause.
+    """
     first_seen, first_dynamic = {}, {}
     for stamp, track in walker_matches:
         track_id = track['id']
         first_seen.setdefault(track_id, stamp)
         if track['state'] == 'DYNAMIC':
             first_dynamic.setdefault(track_id, stamp)
-    delays = [stamp - first_seen[track_id] for track_id, stamp in first_dynamic.items()]
+    delays = []
+    for track_id, stamp in first_dynamic.items():
+        moving_from = movement_start(walker, stamp + time_offset) - time_offset
+        delays.append(stamp - max(first_seen[track_id], moving_from))
     return max(delays) if delays else None
 
 
@@ -213,7 +240,7 @@ def score(frames, walker, standing, time_offset=None):
         'false_dynamic_rate': (
             false_dynamic / len(standing_matches) if standing_matches else None
         ),
-        'time_to_dynamic_s': time_to_dynamic(walker_matches),
+        'time_to_dynamic_s': time_to_dynamic(walker_matches, walker, time_offset),
         'ghosts': count_ghosts(frames, standing),
         'rate_hz_p95': 1.0 / slow_interval if slow_interval else None,
         'latency_p95_s': percentile([frame['latency_s'] for frame in frames], 0.95),
