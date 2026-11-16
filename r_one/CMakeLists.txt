@@ -45,6 +45,11 @@ if(BUILD_TESTING)
     ENV PYTHONNOUSERSITE=1
   )
 
+  # Tests for the world-space tracker and the static world model
+  ament_add_pytest_test(tracking_tests test/test_tracking.py
+    ENV PYTHONNOUSERSITE=1
+  )
+
   # Launch-based integration test, run on an isolated ROS_DOMAIN_ID
   ament_add_ros_isolated_pytest_test(launch_integration_tests test/test_launch_integration.py
     ENV PYTHONNOUSERSITE=1

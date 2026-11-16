@@ -139,6 +139,25 @@ class TestScoring(unittest.TestCase):
             frame['tracks'][0]['state'] = 'STATIC'
         self.assertAlmostEqual(score(frames)['time_to_dynamic_s'], 2.0)
 
+    def test_delay_before_dynamic_skips_the_walker_pause(self):
+        # The walker pauses from 4.0 to 4.5 s. An ID first seen at 3.6 s and DYNAMIC at
+        # 5.0 s took 0.5 s from when the walker set off again, not 1.4 s.
+        frames = [frame for frame in perfect_frames() if frame['stamp'] >= 3.5]
+        for frame in frames:
+            if frame['stamp'] < 5.0:
+                frame['tracks'][0]['state'] = 'STATIC'
+        delay = score_run.score(frames, WALKER, STANDING, 0.0)['time_to_dynamic_s']
+        self.assertAlmostEqual(delay, 0.5, delta=score_run.MOVEMENT_STEP_S)
+
+    def test_movement_start_is_found_across_a_pause(self):
+        self.assertAlmostEqual(
+            score_run.movement_start(WALKER, 5.0), 4.5, delta=score_run.MOVEMENT_STEP_S
+        )
+        # During a pause, the answer is the start of the walk that just ended
+        self.assertAlmostEqual(
+            score_run.movement_start(WALKER, 4.25), 0.0, delta=score_run.MOVEMENT_STEP_S
+        )
+
     def test_world_model_entry_on_the_walker_path_is_a_ghost(self):
         frames = perfect_frames()
         frames[-1]['world_model']['person_9'] = [4.5, 0.5, 0.0]

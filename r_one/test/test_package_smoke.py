@@ -4,7 +4,7 @@ import os
 import unittest
 
 from r_one import mock_ai, sensor_fusion, situational_awareness
-from r_one.spatial_vision import KalmanTracker2D, resolve_model_path
+from r_one.spatial_vision import resolve_model_path, Tracker, WorldModel
 
 
 class TestModulesImport(unittest.TestCase):
@@ -13,23 +13,11 @@ class TestModulesImport(unittest.TestCase):
             self.assertTrue(callable(module.main), module.__name__)
 
 
-class TestKalmanTracker2D(unittest.TestCase):
-    def test_converges_to_constant_velocity(self):
-        tracker = KalmanTracker2D(0.0, 0.0)
-        dt = 0.1
-        vx = 0.0
-        for step in range(1, 41):
-            tracker.predict(dt)
-            _, _, vx, _ = tracker.update(1.0 * step * dt, 0.0)
-        self.assertAlmostEqual(vx, 1.0, delta=0.1)
-
-    def test_predict_counts_missed_frames_and_update_resets(self):
-        tracker = KalmanTracker2D(0.0, 0.0)
-        tracker.predict(0.1)
-        tracker.predict(0.1)
-        self.assertEqual(tracker.missed_frames, 2)
-        tracker.update(0.0, 0.0)
-        self.assertEqual(tracker.missed_frames, 0)
+class TestTrackerWiring(unittest.TestCase):
+    def test_node_module_uses_the_tracker_and_world_model(self):
+        # test_tracking.py covers both in depth; this only checks the node can reach them.
+        self.assertEqual(Tracker().step(0.0, []), [])
+        self.assertEqual(len(WorldModel()), 0)
 
 
 class TestResolveModelPath(unittest.TestCase):

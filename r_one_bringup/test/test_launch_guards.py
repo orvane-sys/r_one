@@ -96,8 +96,9 @@ class TestSceneLaunch(unittest.TestCase):
 
     def test_tracker_settings_are_exposed(self):
         context = resolve_arguments(self.description)
-        self.assertEqual(context.launch_configurations['tracking_filter'], 'ema')
-        self.assertEqual(context.launch_configurations['ema_alpha'], '0.35')
+        self.assertEqual(context.launch_configurations['speed_threshold'], '0.15')
+        self.assertNotIn('tracking_filter', context.launch_configurations)
+        self.assertNotIn('ema_alpha', context.launch_configurations)
 
 
 class TestPerceptionLaunch(unittest.TestCase):

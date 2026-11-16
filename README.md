@@ -19,10 +19,10 @@ This table is the honest state of each feature. Anything not marked **Works** is
 
 | Feature | Status | Notes |
 |---|---|---|
-| YOLOv8 + ByteTrack detection, lidar/depth ranging, TF projection to `odom` | Works (simulation) | Camera bearing is used directly as lidar bearing, so close, off-axis objects can be mis-ranged. Gazebo actors have no collisions, so the simulated lidar cannot see the people in the demo and simulation ranges with the depth camera instead |
-| Velocity estimate and `STATIC`/`DYNAMIC` label | Experimental | A target moving slowly relative to the frame rate can be labelled `STATIC`; first sightings are `STATIC`. Low frame rates cause ID churn, which makes this worse (software-rendered Gazebo runs at about 5 FPS) |
-| Persistent world model | Experimental | Entries are not yet evicted, so ID churn can grow memory. Walking people can be stored as ghost entries |
-| Kalman tracker and occlusion coasting | Experimental | Coasting uses a fixed time step |
+| YOLOv8 detection, lidar/depth ranging, TF projection to `odom` | Works (simulation) | Camera bearing is used directly as lidar bearing, so close, off-axis objects can be mis-ranged. Gazebo actors have no collisions, so the simulated lidar cannot see the people in the demo and simulation ranges with the depth camera instead |
+| Velocity estimate and `STATIC`/`DYNAMIC` label | Experimental | New tracks are `UNKNOWN` until their motion is clear. Tuned on one recorded run and synthetic tests. A target slower than `speed_threshold` is labelled `STATIC` |
+| Persistent world model | Experimental | Only proven-static tracks enter it. Capped at 256 entries, least recently seen evicted first. Not yet kept across restarts |
+| World-space tracker and occlusion coasting | Experimental | See [World-Space Tracker](#world-space-tracker). Tracks end after 2.5 s without a match |
 | Rosbag playback mode | Experimental | Download the sample bag with `r_one/scripts/download_sample_bag.sh`, or record your own with `scripts/record_sample_bag.sh` |
 | Lifecycle (`configure`/`activate`) | Experimental | State transitions work, but the model is loaded and inference runs regardless of state |
 | Emergency braking (`sensor_fusion_node`) | **Prototype, unsafe** | Misses most close obstacles, does not fail safe on lidar loss, and is not started by any launch file |
@@ -47,10 +47,10 @@ flowchart TD
 
     subgraph Perception ["Core Spatial Perception Node"]
         SYNC["message_filters.ApproximateTimeSynchronizer<br/>(80ms window tolerance)"]
-        YOLO["YOLOv8 + ByteTrack<br/>(2D BBoxes + Unique IDs)"]
+        YOLO["YOLOv8<br/>(2D BBoxes)"]
         GEOM["Range Lookup<br/>(5-beam median or 5x5 depth patch)"]
         TRANS["TF2 Transform: sensor frame -> odom<br/>(Global Projection)"]
-        KIN["Global Kinematics & Speed Estimator<br/>(v = dr / dt in odom frame)"]
+        KIN["World-Space Tracker<br/>(Kalman filter + Hungarian matching in odom)"]
         WM["Persistent World Model Memory<br/>(Object Permanence)"]
     end
 
@@ -82,7 +82,7 @@ flowchart TD
 
 1. **Approximate Time Sensor Synchronization:** Synchronizes `/camera/image_raw` with `/scan` or the depth image using `message_filters.ApproximateTimeSynchronizer` (slop: 80ms). Lidar ranges use a 5-beam median at the box centre, and depth ranges use a 5×5 median patch.
 2. **Global Coordinates (TF2):** Projects detected objects into the global frame (`odom` or `map`). As the robot drives or rotates, stored static objects in `world_model` stay fixed in that frame (odometry itself drifts over time; use `map` with SLAM to bound it).
-3. **True Metric Kinematics & Velocity Projection:** Computes object velocity vectors $(\Delta x / \Delta t, \Delta y / \Delta t)$ in the fixed world frame. Publishes predicted footprints ($t = 0.5\text{s} \dots 2.0\text{s}$) as a standard `sensor_msgs/msg/PointCloud2`. `config/nav2_params.yaml` lists this topic as a costmap source, but no launch file starts Nav2 yet.
+3. **True Metric Kinematics & Velocity Projection:** Estimates each object's velocity in the fixed world frame with a Kalman filter. Publishes predicted footprints ($t = 0.5\text{s} \dots 2.0\text{s}$) as a standard `sensor_msgs/msg/PointCloud2`. `config/nav2_params.yaml` lists this topic as a costmap source, but no launch file starts Nav2 yet.
 4. **Interactive 3D RViz2 Displays:** Publishes standard `visualization_msgs/msg/MarkerArray` to `/perception/markers`:
    - **3D Bounding Cubes**: Color-coded green (`STATIC`) and orange (`DYNAMIC`).
    - **Floating HUD Text**: Object class, tracking ID, state, and metric speed in m/s.
@@ -167,8 +167,6 @@ ros2 launch r_one_bringup spatial_scene.launch.py
 | `target_frame` | `odom` | Reference frame for world coordinates | `target_frame:=map` (with SLAM/Nav2) |
 | `depth_source` | `depth_image` in simulation, `lidar` with `sim:=false` | Depth sensor backend: `'lidar'` or `'depth_image'` | `depth_source:=lidar` |
 | `depth_topic` | `camera/depth/image_raw` | Depth image topic when depth_source is depth_image | `depth_topic:=camera/depth/image_raw` |
-| `tracking_filter` | `ema` | Position and velocity filter: `'ema'` or `'kalman'` | `tracking_filter:=kalman` |
-| `ema_alpha` | `0.35` | EMA smoothing weight | `ema_alpha:=0.5` |
 | `speed_threshold` | `0.15` | Velocity threshold (m/s) for dynamic objects | `speed_threshold:=0.25` |
 | `use_sim_time` | same as `sim` | Use the `/clock` topic | `use_sim_time:=true` |
 | `show_camera_window` | `false` | Open separate OpenCV 2D detection window | `show_camera_window:=true` |
@@ -229,8 +227,6 @@ ros2 run r_one mock_ai_node
 | `depth_source` | `string` | `'lidar'` | No | Depth sensor source: `'lidar'` (2D scan) or `'depth_image'` (RGB-D pinhole projection). The simulation launch file sets `'depth_image'` |
 | `depth_topic` | `string` | `'camera/depth/image_raw'` | No | Depth image topic when depth_source is depth_image |
 | `speed_threshold` | `double` | `0.15` | **Yes** | Minimum speed (m/s) to classify an object as `DYNAMIC` |
-| `ema_alpha` | `double` | `0.35` | **Yes** | Exponential Moving Average smoothing factor $\alpha \in (0.0, 1.0]$ for velocity estimation |
-| `tracking_filter` | `string` | `'ema'` | **Yes** | Kinematics tracking filter: `'ema'` (velocity smoothing) or `'kalman'` (2D state-space with occlusion coasting) |
 | `sync_slop` | `double` | `0.08` | **Yes** | Maximum allowable time delta (seconds) between camera and depth messages |
 | `process_every_n_frames` | `int` | `5` (`2` in the simulation launch file) | **Yes** | Frame skip rate to minimize CPU/GPU load |
 | `show_debug_window` | `bool` | `false` | **Yes** | Displays OpenCV annotated 2D camera window |
@@ -242,14 +238,11 @@ ros2 run r_one mock_ai_node
 
 ### Dynamic Parameter Reconfiguration
 
-Filter thresholds, frame skip ratios, and smoothing coefficients can be reconfigured live during runtime without restarting the node:
+The speed threshold, frame skip ratio and sync slop can be reconfigured live during runtime without restarting the node:
 
 ```bash
 # Tune velocity classification threshold live (m/s)
 ros2 param set /spatial_vision speed_threshold 0.20
-
-# Adjust EMA velocity smoothing factor (0.0 < alpha <= 1.0)
-ros2 param set /spatial_vision ema_alpha 0.40
 
 # Adjust inference frequency (every N frames)
 ros2 param set /spatial_vision process_every_n_frames 3
@@ -266,7 +259,7 @@ ros2 param set /spatial_vision show_debug_window true
 
 `SpatialVisionNode` is configured with `ReentrantCallbackGroup` and spins under a 4-thread `MultiThreadedExecutor`:
 - **Thread 1:** Sensor synchronization and camera image ingestion.
-- **Thread 2:** YOLOv8 neural network inference and ByteTrack data association.
+- **Thread 2:** YOLOv8 neural network inference and world-space tracking.
 - **Thread 3:** TF2 coordinate transformation lookups and pinhole back-projection.
 - **Thread 4:** Publisher serialization (`PointCloud2`, `MarkerArray`, `Detection3DArray`, Diagnostics).
 
@@ -286,7 +279,7 @@ ros2 topic echo /diagnostics
 **Monitored Metrics:**
 - `fps`: 1 ÷ average processing time. This is the rate the pipeline could reach, not the rate it is running at.
 - `latency_ms`: Cycle time per inference and tracking step. Automatically elevates status to `WARN` if latency exceeds 100 ms ($<10$ FPS).
-- `active_tracks`: Size of the track history. In `ema` mode it is never trimmed, so it counts every ID seen since startup.
+- `active_tracks`: Live tracks, including unconfirmed ones and ones coasting through an occlusion. Capped at 64.
 - `world_model_objects`: Count of static spatial entities retained in global coordinates.
 - `sync_delta_ms`: Age of the last processed frame (clock time minus sensor stamp), not the gap between the two sensors.
 
@@ -326,17 +319,20 @@ Exposes standard ROS 2 service servers for live memory and tracker management wi
 # 1. Clear static world model and wipe RViz cylinder markers
 ros2 service call /spatial_vision/clear_world_model std_srvs/srv/Trigger
 
-# 2. Reset kinematics buffers (note: the ByteTrack state inside the YOLO model is not reset yet)
+# 2. Drop every track and restart track IDs from 1
 ros2 service call /spatial_vision/reset_tracker std_srvs/srv/Trigger
 ```
 
 ---
 
-### 2D Constant-Velocity Kalman Filter & Occlusion Coasting
+### World-Space Tracker
 
-Along with EMA velocity smoothing, `SpatialVisionNode` supports a 2D state-space Kalman Filter ($\mathbf{x} = [x, y, v_x, v_y]^T$):
-- **Dynamic Activation:** Switch tracking filter on the fly via `ros2 param set /spatial_vision tracking_filter kalman`.
-- **Occlusion Coasting:** When a track is lost, it coasts for 4 processed frames and is dropped on the 5th. That is 2 s or more at the default settings. Each coasted step assumes a fixed 0.08 s, so the predicted position falls behind a moving target.
+`SpatialVisionNode` tracks objects in `target_frame` with its own tracker ([tracking.py](r_one/r_one/tracking.py)). YOLO's ByteTrack IDs are ignored.
+- **Filter:** each track has a constant-velocity Kalman filter ($\mathbf{x} = [x, y, v_x, v_y]^T$) that uses the real time between frames.
+- **Matching:** each frame, tracks are matched to the ranged detections of the same class by Mahalanobis distance, using the Hungarian method. A track is published after its second match.
+- **Occlusion coasting:** an unmatched track keeps predicting, and its uncertainty grows. A moving track still feeds the costmap while it coasts. A track ends after 2.5 s without a match.
+- **Motion:** a track turns `DYNAMIC` once its speed clearly exceeds `speed_threshold`, and `STATIC` after 5 slow matches in a row. Only tracks that are `STATIC` and at least 1 s old enter the world model, and a `DYNAMIC` track leaves it.
+- The tuning is fixed in `TrackerConfig`. Only `speed_threshold` is a ROS parameter.
 
 ---
 
@@ -380,7 +376,7 @@ ros2 run r_one spatial_vision_node --ros-args -r __ns:=/robot_1
 | Service | Type | Description |
 |---|---|---|
 | `~/clear_world_model` | `std_srvs/srv/Trigger` | Clears all cached static objects from world model memory and wipes RViz visual markers |
-| `~/reset_tracker` | `std_srvs/srv/Trigger` | Resets kinematics history and Kalman filter state (ByteTrack IDs are not reset yet) |
+| `~/reset_tracker` | `std_srvs/srv/Trigger` | Drops every track and restarts track IDs from 1. The world model is kept |
 
 ---
 
@@ -393,7 +389,7 @@ colcon test && colcon test-result --verbose
 ```
 
 > [!NOTE]
-> The unit tests import the real `r_one` modules. They cover startup validation, crash guards, launch arguments, the Kalman filter and the scoring tools. They do not yet check detection accuracy or safety behaviour.
+> The unit tests import the real `r_one` modules. They cover startup validation, crash guards, launch arguments, the tracker and the scoring tools. They do not yet check detection accuracy or safety behaviour.
 
 ### Scoring a Run
 

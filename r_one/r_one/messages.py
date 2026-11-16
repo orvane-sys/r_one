@@ -1,7 +1,7 @@
 """Build the ROS messages that spatial_vision publishes: costmap cloud, 3D detections, markers."""
 
 import struct
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 from geometry_msgs.msg import Point
 from rclpy.duration import Duration
@@ -22,6 +22,12 @@ except (ImportError, ModuleNotFoundError):
     Detection3D = None
     Detection3DArray = None
     ObjectHypothesisWithPose = None
+
+# append_markers draws a track in these namespaces, with the track ID as the marker ID.
+TRACK_MARKER_NAMESPACES = (
+    'detected_objects', 'object_labels', 'velocity_vectors', 'predicted_trajectories',
+)
+WORLD_MODEL_NAMESPACE = 'world_model_memory'
 
 
 def build_pointcloud2(
@@ -206,7 +212,7 @@ def append_world_model_markers(
         wm_marker = Marker()
         wm_marker.header.frame_id = frame_id
         wm_marker.header.stamp = stamp
-        wm_marker.ns = 'world_model_memory'
+        wm_marker.ns = WORLD_MODEL_NAMESPACE
         wm_marker.id = idx
         wm_marker.type = Marker.CYLINDER
         wm_marker.action = Marker.ADD
@@ -223,3 +229,21 @@ def append_world_model_markers(
         wm_marker.color.a = 0.45
         wm_marker.lifetime = Duration(seconds=2.0).to_msg()
         marker_array.markers.append(wm_marker)
+
+
+def append_delete_markers(
+    marker_array: MarkerArray,
+    frame_id: str,
+    namespace: str,
+    marker_ids: Iterable[int],
+    stamp,
+):
+    """Remove the given markers of one namespace from RViz."""
+    for marker_id in marker_ids:
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = stamp
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.action = Marker.DELETE
+        marker_array.markers.append(marker)

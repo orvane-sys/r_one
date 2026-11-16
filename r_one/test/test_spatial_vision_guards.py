@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import Point
 import numpy as np
 import rclpy
 from rclpy.parameter import Parameter
@@ -13,12 +15,15 @@ from sensor_msgs.msg import CameraInfo
 
 from r_one import geometry, spatial_vision
 from r_one.detectors import ultralytics_detector
+from r_one.detectors.base import Detection
 from r_one.spatial_vision import (
     debug_window_supported,
     intrinsics_are_valid,
     SpatialVisionNode,
     validate_parameter,
 )
+from r_one.tracking import Tracker, TrackerConfig
+from r_one.world_model import WorldModel
 
 
 def camera_info(k):
@@ -30,6 +35,8 @@ def camera_info(k):
 def fake_node(**overrides):
     """Build the attributes that the node methods under test read from self."""
     logger = mock.Mock()
+    clock = mock.Mock()
+    clock.now.return_value.nanoseconds = 0
     attrs = dict(
         fx=None,
         fy=None,
@@ -43,13 +50,23 @@ def fake_node(**overrides):
         img_size=320,
         speed_threshold=0.15,
         sync_slop=0.08,
-        ema_alpha=0.35,
-        tracking_filter='ema',
         show_debug_window=False,
         time_sync=None,
         get_logger=lambda: logger,
+        get_clock=lambda: clock,
         process_perception_frame=mock.Mock(),
         run_log=mock.Mock(),
+        tracker=Tracker(TrackerConfig(speed_threshold_mps=0.15)),
+        world_model=WorldModel(),
+        world_marker_count=0,
+        target_frame='odom',
+        tf_buffer=mock.Mock(),
+        marker_pub=mock.Mock(),
+        costmap_obstacle_pub=mock.Mock(),
+        detection_3d_pub=None,
+        cycle_times=[],
+        last_sync_delta_ms=0.0,
+        last_inference_latency=0.0,
     )
     attrs.update(overrides)
     return SimpleNamespace(**attrs)
@@ -90,9 +107,6 @@ class TestParameterValidation(unittest.TestCase):
             ('speed_threshold', -0.1),
             ('speed_threshold', float('nan')),
             ('sync_slop', 0.0),
-            ('ema_alpha', 0.0),
-            ('ema_alpha', 1.5),
-            ('tracking_filter', 'particle'),
             ('depth_source', 'sonar'),
         ):
             with self.subTest(name=name, value=value):
@@ -104,8 +118,6 @@ class TestParameterValidation(unittest.TestCase):
             ('img_size', 320),
             ('speed_threshold', 0.0),
             ('sync_slop', 0.08),
-            ('ema_alpha', 1.0),
-            ('tracking_filter', 'KALMAN'),
             ('depth_source', 'depth_image'),
             ('target_frame', 'anything'),
         ):
@@ -116,19 +128,22 @@ class TestParameterValidation(unittest.TestCase):
         node = fake_node()
         result = SpatialVisionNode.parameters_callback(node, [
             Parameter('speed_threshold', value=0.9),
-            Parameter('ema_alpha', value=2.0),
+            Parameter('process_every_n_frames', value=0),
         ])
         self.assertFalse(result.successful)
         self.assertEqual(node.speed_threshold, 0.15)
+        self.assertEqual(node.tracker.config.speed_threshold_mps, 0.15)
+        self.assertEqual(node.process_every_n, 1)
 
     def test_valid_multi_parameter_set_applies_everything(self):
         node = fake_node()
         result = SpatialVisionNode.parameters_callback(node, [
             Parameter('speed_threshold', value=0.9),
-            Parameter('ema_alpha', value=0.5),
+            Parameter('process_every_n_frames', value=3),
         ])
         self.assertTrue(result.successful)
-        self.assertEqual((node.speed_threshold, node.ema_alpha), (0.9, 0.5))
+        self.assertEqual((node.speed_threshold, node.process_every_n), (0.9, 3))
+        self.assertEqual(node.tracker.config.speed_threshold_mps, 0.9)
 
 
 class TestNodeStartup(unittest.TestCase):
@@ -148,8 +163,17 @@ class TestNodeStartup(unittest.TestCase):
     def test_unknown_depth_source_is_rejected(self):
         self.assert_startup_rejected('depth_source:=sonar')
 
-    def test_unknown_tracking_filter_is_rejected(self):
-        self.assert_startup_rejected('tracking_filter:=particle')
+    def test_removed_tracking_filter_is_ignored(self):
+        # tracking_filter was removed in 2d; old launch commands that still pass it must start.
+        rclpy.init(args=['--ros-args', '-p', 'tracking_filter:=particle'])
+        try:
+            with mock.patch.object(ultralytics_detector, 'YOLO', None), \
+                    mock.patch.object(ultralytics_detector, 'YOLO_AVAILABLE', False):
+                node = SpatialVisionNode()
+            self.assertFalse(node.has_parameter('tracking_filter'))
+            node.destroy_node()
+        finally:
+            rclpy.shutdown()
 
 
 class TestFrameErrorHandling(unittest.TestCase):
@@ -175,6 +199,33 @@ class TestFrameErrorHandling(unittest.TestCase):
         self.frame(node)
         node.get_logger().error.assert_called_once()
         node.detector.detect.assert_not_called()
+
+
+class TestFrameTracking(unittest.TestCase):
+    def test_a_detection_is_published_once_its_track_is_confirmed(self):
+        node = fake_node(fx=500.0, fy=500.0, cx=50.0, cy=50.0)
+        node.bridge.imgmsg_to_cv2.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+        node.detector.detect.return_value = [Detection(40.0, 40.0, 60.0, 60.0, 'person', 0.9)]
+        depth = np.full((100, 100), 2.0, dtype=np.float32)
+        with mock.patch.object(
+            geometry, 'transform_point', return_value=Point(x=1.0, y=2.0, z=0.0)
+        ):
+            for sec in (1, 2):
+                SpatialVisionNode.process_perception_frame(
+                    node,
+                    img_msg=object(),
+                    stamp=Time(sec=sec, nanosec=0),
+                    sensor_data=depth,
+                    is_depth_image=True,
+                )
+
+        logged = [call.args[2] for call in node.run_log.write_frame.call_args_list]
+        self.assertEqual(logged[0], [])
+        self.assertEqual(len(logged[1]), 1)
+        self.assertEqual((logged[1][0]['id'], logged[1][0]['class']), (1, 'person'))
+        self.assertAlmostEqual(logged[1][0]['x'], 1.0)
+        node.marker_pub.publish.assert_called_once()
+        node.get_logger().info.assert_not_called()
 
 
 class TestDepthRanging(unittest.TestCase):

@@ -20,14 +20,6 @@ PARAMETER_RULES = {
         lambda value: value > 0.0,
         "sync_slop must be > 0.0",
     ),
-    'ema_alpha': (
-        lambda value: 0.0 < value <= 1.0,
-        "ema_alpha must be in range (0.0, 1.0]",
-    ),
-    'tracking_filter': (
-        lambda value: str(value).lower() in ('ema', 'kalman'),
-        "tracking_filter must be 'ema' or 'kalman'",
-    ),
     'depth_source': (
         lambda value: value in ('lidar', 'depth_image'),
         "depth_source must be 'lidar' or 'depth_image'",

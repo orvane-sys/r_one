@@ -3,6 +3,24 @@
 import json
 
 
+def track_record(track):
+    """Return the run log entry for one tracker track."""
+    x, y, z = track.position
+    vx, vy = track.velocity
+    return {
+        'id': track.id,
+        'class': track.class_name,
+        'score': track.measurement.score,
+        'x': x,
+        'y': y,
+        'z': z,
+        'vx': vx,
+        'vy': vy,
+        'state': track.motion,
+        'box': list(track.measurement.box),
+    }
+
+
 class RunLog:
     """Write one JSON line per processed frame. An empty path turns logging off."""
 
