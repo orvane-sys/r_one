@@ -1,4 +1,4 @@
-"""Ultralytics YOLO with its built-in ByteTrack, returning plain Detection objects."""
+"""Ultralytics YOLO in plain detection mode, returning plain Detection objects."""
 
 import os
 from typing import List
@@ -25,7 +25,12 @@ def resolve_model_path(name: str) -> str:
 
 
 class UltralyticsDetector:
-    """Detect and track with one YOLO model, so ByteTrack keeps its state between frames."""
+    """
+    Detect with one YOLO model. Tracking is left to r_one.tracking.
+
+    predict() is used, not track(): ByteTrack withholds the box of a newly seen object
+    for its first frame, which loses a person who reappears after a gap.
+    """
 
     def __init__(self, model_path: str, img_size: int):
         self.model = YOLO(model_path)
@@ -33,13 +38,7 @@ class UltralyticsDetector:
         self._last_results = None
 
     def detect(self, image) -> List[Detection]:
-        results = self.model.track(
-            image,
-            persist=True,
-            tracker='bytetrack.yaml',
-            imgsz=self.img_size,
-            verbose=False,
-        )
+        results = self.model.predict(image, imgsz=self.img_size, verbose=False)
         self._last_results = results
         detections = []
         for box in results[0].boxes:

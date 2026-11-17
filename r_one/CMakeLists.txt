@@ -50,6 +50,11 @@ if(BUILD_TESTING)
     ENV PYTHONNOUSERSITE=1
   )
 
+  # Tests for the one-frame hand-off between the sensor callbacks and the perception worker
+  ament_add_pytest_test(frame_slot_tests test/test_frame_slot.py
+    ENV PYTHONNOUSERSITE=1
+  )
+
   # Launch-based integration test, run on an isolated ROS_DOMAIN_ID
   ament_add_ros_isolated_pytest_test(launch_integration_tests test/test_launch_integration.py
     ENV PYTHONNOUSERSITE=1

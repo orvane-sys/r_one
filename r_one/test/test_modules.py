@@ -1,12 +1,15 @@
 """Unit tests for the modules split out of spatial_vision, run without starting ROS."""
 
 import dataclasses
+import math
 import struct
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Quaternion, Transform, Vector3
+import numpy as np
+from rclpy.duration import Duration
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 import tf2_ros
@@ -28,10 +31,10 @@ def fake_box(xyxy, class_id, score, track_id=None):
 
 
 def fake_yolo(boxes):
-    """Stand in for ultralytics.YOLO: one model whose track() returns these boxes."""
+    """Stand in for ultralytics.YOLO: one model whose predict() returns these boxes."""
     result = mock.Mock(boxes=boxes)
     model = mock.Mock(names={0: 'person', 56: 'chair'})
-    model.track.return_value = [result]
+    model.predict.return_value = [result]
     return mock.Mock(return_value=model)
 
 
@@ -76,63 +79,184 @@ class TestUltralyticsDetector(unittest.TestCase):
             Detection(1.0, 2.0, 3.0, 4.0, 'chair', 0.5, -1),
         ])
 
-    def test_tracking_state_persists_on_one_model(self):
+    def test_detect_runs_plain_detection_on_one_model(self):
         detector = self.make([])
         detector.detect('first')
         detector.detect('second')
-        self.assertEqual(detector.model.track.call_count, 2)
-        detector.model.track.assert_called_with(
-            'second', persist=True, tracker='bytetrack.yaml', imgsz=320, verbose=False
-        )
+        self.assertEqual(detector.model.predict.call_count, 2)
+        detector.model.predict.assert_called_with('second', imgsz=320, verbose=False)
+        detector.model.track.assert_not_called()
 
     def test_plot_draws_the_last_frame(self):
         detector = self.make([])
         self.assertIsNone(detector.plot())
         detector.detect('image')
-        self.assertIs(detector.plot(), detector.model.track.return_value[0].plot.return_value)
+        self.assertIs(detector.plot(), detector.model.predict.return_value[0].plot.return_value)
 
 
-class TestLidarDistance(unittest.TestCase):
-    def test_median_of_the_beams_around_the_bearing(self):
-        ranges = [5.0] * 11
-        ranges[4:7] = [2.0, 2.1, 2.2]
-        self.assertAlmostEqual(geometry.extract_lidar_distance(0.0, scan(ranges)), 2.2)
+# The robot's laser_frame to camera_optical_link transform, as the sample bag's /tf_static
+# gives it: the lidar sits 0.205 m behind the camera and 0.095 m above it.
+LASER_TO_OPTICAL = Transform(
+    translation=Vector3(x=0.0, y=-0.095, z=-0.205),
+    rotation=Quaternion(x=0.5, y=-0.5, z=0.5, w=0.5),
+)
+# The sample bag's camera intrinsics and scan layout
+FX = FY = 528.43
+CX, CY = 320.5, 240.5
 
-    def test_invalid_beams_are_ignored(self):
-        ranges = [float('inf')] * 11
-        ranges[5] = 3.0
-        self.assertAlmostEqual(geometry.extract_lidar_distance(0.0, scan(ranges)), 3.0)
 
-    def test_bearing_outside_the_scan_has_no_range(self):
-        self.assertIsNone(geometry.extract_lidar_distance(1.0, scan([2.0] * 11)))
+def synthetic_scan(circles, background=4.0):
+    """Return a 360-beam scan, in the laser frame, of circles (x, y, radius) before a wall."""
+    msg = LaserScan()
+    msg.angle_min = -3.14
+    msg.angle_increment = 0.01749
+    msg.angle_max = msg.angle_min + msg.angle_increment * 359
+    msg.range_min = 0.3
+    msg.range_max = 12.0
+    ranges = []
+    for i in range(360):
+        angle = msg.angle_min + i * msg.angle_increment
+        dx, dy = math.cos(angle), math.sin(angle)
+        best = background
+        for x, y, radius in circles:
+            along = dx * x + dy * y
+            disc = along * along - (x * x + y * y) + radius * radius
+            if disc >= 0.0 and along - math.sqrt(disc) > 0.0:
+                best = min(best, along - math.sqrt(disc))
+        ranges.append(best)
+    msg.ranges = ranges
+    return msg
+
+
+def camera_points(scan_msg):
+    return geometry.transform_points(
+        geometry.transform_to_matrix(LASER_TO_OPTICAL), geometry.scan_points(scan_msg)
+    )
+
+
+def centroid_in_box(scan_msg, box):
+    return geometry.nearest_cluster(
+        geometry.points_in_box(camera_points(scan_msg), box, FX, FY, CX, CY)
+    )
+
+
+class TestScanPoints(unittest.TestCase):
+    def test_valid_beams_become_points_in_the_scan_frame(self):
+        points = geometry.scan_points(scan([2.0, 3.0], angle_min=0.0, angle_increment=math.pi / 2))
+        np.testing.assert_allclose(points, [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0]], atol=1e-9)
+
+    def test_invalid_beams_are_dropped(self):
+        ranges = [float('inf'), float('nan'), 0.05, 10.0, 11.0, 2.0]
+        points = geometry.scan_points(scan(ranges, angle_min=0.0, angle_increment=0.0))
+        np.testing.assert_allclose(points, [[2.0, 0.0, 0.0]])
+
+
+class TestTransformToMatrix(unittest.TestCase):
+    def test_the_robots_extrinsics_put_the_lidar_behind_and_above_the_camera(self):
+        matrix = geometry.transform_to_matrix(LASER_TO_OPTICAL)
+        # Laser forward, left and up become optical +z, -x and -y
+        np.testing.assert_allclose(
+            geometry.transform_points(matrix, np.array([
+                [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+            ])),
+            [
+                [0.0, -0.095, -0.205], [0.0, -0.095, 0.795],
+                [-1.0, -0.095, -0.205], [0.0, -1.095, -0.205],
+            ],
+            atol=1e-9,
+        )
+
+
+class TestPointsInBox(unittest.TestCase):
+    def test_keeps_points_that_project_into_the_box(self):
+        points = np.array([
+            [0.0, 0.0, 2.0],  # The image centre
+            [1.0, 0.0, 2.0],  # Far to the right
+            [0.0, 0.0, -2.0],  # Behind the camera, though it would project to the centre
+        ])
+        kept = geometry.points_in_box(points, (300.0, 220.0, 340.0, 260.0), FX, FY, CX, CY)
+        np.testing.assert_allclose(kept, [[0.0, 0.0, 2.0]])
+
+    def test_no_points_gives_an_empty_array(self):
+        kept = geometry.points_in_box(np.zeros((0, 3)), (0.0, 0.0, 640.0, 480.0), FX, FY, CX, CY)
+        self.assertEqual(kept.shape, (0, 3))
+
+
+class TestNearestCluster(unittest.TestCase):
+    def test_legs_with_a_gap_range_the_person_not_the_wall(self):
+        # Two legs 1.0 m in front of the camera and 0.2 m apart, a wall at 4 m behind and
+        # between them. A median of the beams at the box centre returns 4 m here.
+        legs = synthetic_scan([(1.205, 0.1, 0.06), (1.205, -0.1, 0.06)])
+        centroid = centroid_in_box(legs, (230.0, 0.0, 410.0, 480.0))
+        self.assertLess(abs(centroid[2] - 1.0), 0.1)
+        self.assertLess(abs(centroid[0]), 0.05)
+
+    def test_an_object_off_to_the_side_gets_its_own_beams(self):
+        # A post 1.5 m ahead of the camera and 0.6 m to its left. The lidar sees it at a
+        # smaller bearing than the camera does, because the lidar sits 0.205 m further back.
+        post = synthetic_scan([(1.705, 0.6, 0.05)])
+        u = FX * -0.6 / 1.5 + CX
+        centroid = centroid_in_box(post, (u - 25.0, 0.0, u + 25.0, 480.0))
+        self.assertLess(abs(centroid[2] - 1.5), 0.1)
+        self.assertLess(abs(centroid[0] + 0.6), 0.05)
+
+    def test_an_empty_box_has_no_range(self):
+        self.assertIsNone(geometry.nearest_cluster(np.zeros((0, 3))))
+
+    def test_a_box_above_the_scan_plane_has_no_range(self):
+        # The scan plane projects just above the image centre; this box is near the top
+        self.assertIsNone(centroid_in_box(synthetic_scan([]), (0.0, 0.0, 640.0, 100.0)))
+
+    def test_a_single_stray_beam_has_no_range(self):
+        self.assertIsNone(geometry.nearest_cluster(np.array([[0.0, 0.0, 2.0]])))
+
+    def test_a_stray_beam_in_front_is_skipped(self):
+        points = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 3.0], [0.05, 0.0, 3.05]])
+        np.testing.assert_allclose(geometry.nearest_cluster(points), [0.025, 0.0, 3.025])
 
 
 class TestTransformPoint(unittest.TestCase):
-    def test_falls_back_to_the_latest_transform(self):
-        stamps = []
+    def test_looks_up_the_transform_at_the_stamp(self):
+        calls = []
 
         def transform(point_stamped, target_frame, timeout):
-            stamps.append(point_stamped.header.stamp.sec)
-            if len(stamps) == 1:
-                raise tf2_ros.ExtrapolationException('too old')
+            calls.append((point_stamped.header.stamp.sec, target_frame, timeout))
             return SimpleNamespace(point=Point(x=point_stamped.point.x + 1.0))
 
-        buffer = mock.Mock(transform=transform)
+        counts = {'tf_failures': 0}
         point = geometry.transform_point(
-            buffer, 'odom', 2.0, 0.0, 0.0, 'laser_frame', Time(seconds=5).to_msg(), mock.Mock()
+            mock.Mock(transform=transform), 'odom', 2.0, 0.0, 0.0, 'laser_frame',
+            Time(seconds=5).to_msg(), mock.Mock(), counts,
         )
-        self.assertEqual(stamps, [5, 0])
+        self.assertEqual(calls, [(5, 'odom', Duration(seconds=0.1))])
         self.assertAlmostEqual(point.x, 3.0)
+        self.assertEqual(counts, {'tf_failures': 0})
+
+    def test_a_failed_lookup_gives_none_without_trying_the_latest_transform(self):
+        buffer = mock.Mock()
+        buffer.transform.side_effect = tf2_ros.ExtrapolationException('too old')
+        logger = mock.Mock()
+        counts = {'tf_failures': 0}
+        point = geometry.transform_point(
+            buffer, 'odom', 2.0, 0.0, 0.0, 'laser_frame', Time(seconds=5).to_msg(), logger,
+            counts,
+        )
+        self.assertIsNone(point)
+        buffer.transform.assert_called_once()
+        logger.debug.assert_called_once()
+        self.assertEqual(counts, {'tf_failures': 1})
 
     def test_returns_none_when_no_transform_exists(self):
         buffer = mock.Mock()
         buffer.transform.side_effect = tf2_ros.LookupException('no frame')
         logger = mock.Mock()
+        counts = {'tf_failures': 0}
         point = geometry.transform_point(
-            buffer, 'odom', 2.0, 0.0, 0.0, 'laser_frame', Time().to_msg(), logger
+            buffer, 'odom', 2.0, 0.0, 0.0, 'laser_frame', Time().to_msg(), logger, counts
         )
         self.assertIsNone(point)
         logger.debug.assert_called_once()
+        self.assertEqual(counts, {'tf_failures': 1})
 
 
 class TestMessages(unittest.TestCase):

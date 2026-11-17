@@ -1,15 +1,24 @@
 """Camera intrinsics, range lookup and TF helpers used to place detections in the world."""
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
-from geometry_msgs.msg import Point, PointStamped
+from geometry_msgs.msg import Point, PointStamped, Transform
 import numpy as np
 from rclpy.duration import Duration
-from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 import tf2_geometry_msgs  # noqa: F401 - registers geometry_msgs types with TF2
 import tf2_ros
+
+# Lidar beams inside a box are split into groups wherever their range jumps by more than
+# this. A person's two legs at the same range stay one group; the wall behind them does not.
+CLUSTER_GAP_M = 0.3
+# A group needs this many beams. At 1 m one degree is 1.7 cm, so a leg spans several beams
+# and a single stray beam is ignored.
+CLUSTER_MIN_POINTS = 2
+# Depth readings outside this range are treated as invalid
+DEPTH_MIN_M = 0.1
+DEPTH_MAX_M = 10.0
 
 
 def intrinsics_are_valid(k) -> bool:
@@ -20,35 +29,75 @@ def intrinsics_are_valid(k) -> bool:
     return fx > 0.0 and fy > 0.0
 
 
-def extract_lidar_distance(angle_rad: float, scan: LaserScan) -> Optional[float]:
-    """Return the median valid range of the five beams around a bearing."""
-    target_yaw = math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+def scan_points(scan: LaserScan) -> np.ndarray:
+    """Return the scan's valid beams as an N×3 array of points in the scan's frame."""
+    ranges = np.asarray(scan.ranges, dtype=np.float64)
+    angles = scan.angle_min + scan.angle_increment * np.arange(len(ranges))
+    valid = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < scan.range_max)
+    ranges, angles = ranges[valid], angles[valid]
+    return np.column_stack(
+        (ranges * np.cos(angles), ranges * np.sin(angles), np.zeros(len(ranges)))
+    )
 
-    if scan.angle_min >= 0.0 and target_yaw < 0.0:
-        target_yaw += 2.0 * math.pi
 
-    if target_yaw < scan.angle_min or target_yaw > scan.angle_max:
+def transform_to_matrix(transform: Transform) -> np.ndarray:
+    """Turn a geometry_msgs Transform into a 4×4 matrix."""
+    q = transform.rotation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    matrix = np.eye(4)
+    matrix[:3, :3] = [
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ]
+    t = transform.translation
+    matrix[:3, 3] = [t.x, t.y, t.z]
+    return matrix
+
+
+def transform_points(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Apply a 4×4 transform to an N×3 array of points."""
+    return points @ matrix[:3, :3].T + matrix[:3, 3]
+
+
+def points_in_box(
+    points_cam: np.ndarray,
+    box: Tuple[float, float, float, float],
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> np.ndarray:
+    """Keep the camera-frame points in front of the camera whose pixel falls inside box."""
+    points = points_cam[points_cam[:, 2] > 0.0]
+    u = fx * points[:, 0] / points[:, 2] + cx
+    v = fy * points[:, 1] / points[:, 2] + cy
+    x1, y1, x2, y2 = box
+    inside = (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
+    return points[inside]
+
+
+def nearest_cluster(
+    points: np.ndarray,
+    gap_m: float = CLUSTER_GAP_M,
+    min_points: int = CLUSTER_MIN_POINTS,
+) -> Optional[np.ndarray]:
+    """
+    Return the centroid of the nearest group of points, or None.
+
+    The points are sorted by their distance from the origin and split wherever that
+    distance jumps by more than gap_m. Groups with fewer than min_points points are skipped.
+    """
+    if len(points) == 0:
         return None
-
-    idx = int(round((target_yaw - scan.angle_min) / scan.angle_increment))
-
-    window_ranges = []
-    for offset in range(-2, 3):
-        cur_idx = idx + offset
-        if 0 <= cur_idx < len(scan.ranges):
-            r = scan.ranges[cur_idx]
-            if (
-                scan.range_min < r < scan.range_max
-                and not math.isinf(r)
-                and not math.isnan(r)
-            ):
-                window_ranges.append(r)
-
-    if not window_ranges:
-        return None
-
-    window_ranges.sort()
-    return window_ranges[len(window_ranges) // 2]
+    ranges = np.linalg.norm(points, axis=1)
+    order = np.argsort(ranges)
+    points, ranges = points[order], ranges[order]
+    breaks = np.flatnonzero(np.diff(ranges) > gap_m) + 1
+    for group in np.split(points, breaks):
+        if len(group) >= min_points:
+            return group.mean(axis=0)
+    return None
 
 
 def extract_depth_image_distance(
@@ -73,7 +122,7 @@ def extract_depth_image_distance(
     window = depth_image[v_min:v_max, u_min:u_max]
 
     valid_vals = window[
-        (window > 0.1) & (window < 10.0) & ~np.isnan(window) & ~np.isinf(window)
+        (window > DEPTH_MIN_M) & (window < DEPTH_MAX_M) & ~np.isnan(window) & ~np.isinf(window)
     ]
     if len(valid_vals) == 0:
         return None
@@ -89,8 +138,15 @@ def transform_point(
     source_frame: str,
     stamp,
     logger,
+    counters: Optional[dict] = None,
 ) -> Optional[Point]:
-    """Move a point into target_frame, falling back to the latest transform."""
+    """
+    Move a point into target_frame using the transform at the measurement's stamp.
+
+    Returns None when that transform is not available within 0.1 s. A point placed with a
+    transform from another time would land in the wrong spot while the robot moves. When
+    counters is given, its 'tf_failures' entry counts the failed lookups.
+    """
     pt = PointStamped()
     pt.header.frame_id = source_frame
     pt.header.stamp = stamp
@@ -100,20 +156,11 @@ def transform_point(
 
     try:
         transformed = tf_buffer.transform(
-            pt, target_frame, timeout=Duration(seconds=0.05)
+            pt, target_frame, timeout=Duration(seconds=0.1)
         )
         return transformed.point
-    except (
-        tf2_ros.LookupException,
-        tf2_ros.ExtrapolationException,
-        tf2_ros.ConnectivityException,
-    ):
-        try:
-            pt.header.stamp = Time().to_msg()
-            transformed = tf_buffer.transform(
-                pt, target_frame, timeout=Duration(seconds=0.05)
-            )
-            return transformed.point
-        except Exception as e:
-            logger.debug(f"TF transformation error: {e}")
-            return None
+    except tf2_ros.TransformException as e:
+        if counters is not None:
+            counters['tf_failures'] += 1
+        logger.debug(f"TF transformation error: {e}")
+        return None

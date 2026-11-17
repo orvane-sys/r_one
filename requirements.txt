@@ -7,8 +7,6 @@ numpy>=1.23,<2
 # Not the -headless build: show_debug_window uses cv2.imshow.
 opencv-python>=4.8,<4.11
 ultralytics>=8.3,<8.5
-# ByteTrack association backend used by ultralytics.
-lapx>=0.5
 
 # torch/torchvision are installed separately because the right wheel depends on your
 # hardware (the Dockerfile does this with the TORCH_INDEX_URL build argument):

@@ -6,7 +6,8 @@ import sys
 import tempfile
 import unittest
 
-from r_one.run_log import RunLog
+from r_one.detectors.base import Detection
+from r_one.run_log import detection_record, RunLog
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, os.path.join(REPO_ROOT, 'tools'))
@@ -222,6 +223,26 @@ class TestRunLog(unittest.TestCase):
         self.assertEqual(frames[0]['stamp'], 30.0)
         self.assertEqual(frames[0]['tracks'][0]['id'], 2)
         self.assertEqual(frames[0]['world_model']['person_2'], [still[0], still[1], 0.0])
+
+    def test_raw_detections_and_counters_are_recorded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'run.jsonl')
+            log = RunLog(path)
+            detection = Detection(1.0, 2.0, 3.0, 4.0, 'person', 0.8)
+            log.write_frame(
+                1.0, 0.1, [], {}, [detection_record(detection, False)],
+                {'synced_frames': 7, 'tf_failures': 1},
+            )
+            log.write_frame(2.0, 0.1, [], {})
+            log.close()
+
+            frames = score_run.read_frames(path)
+        self.assertEqual(frames[0]['detections'], [
+            {'class': 'person', 'score': 0.8, 'box': [1.0, 2.0, 3.0, 4.0], 'ranged': False}
+        ])
+        self.assertEqual((frames[0]['synced_frames'], frames[0]['tf_failures']), (7, 1))
+        self.assertEqual(frames[1]['detections'], [])
+        self.assertNotIn('synced_frames', frames[1])
 
     def test_lines_are_flushed_before_close(self):
         with tempfile.TemporaryDirectory() as folder:
