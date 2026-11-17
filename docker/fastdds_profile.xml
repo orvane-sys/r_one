@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Fast DDS (ROS 2 Humble, Fast DDS 2.6) transports for the r_one image.
+
+  The default shared-memory segment is 512 KB. A colour image (0.92 MB) plus a depth image
+  (1.23 MB) do not fit, and best-effort subscribers lost 28-49% of the bag's images
+  (docs/timing_2c.md). A 4 MB segment delivered every image in testing.
+
+  UDP is limited to 127.0.0.1, so ROS traffic stays on this machine, as with
+  ROS_LOCALHOST_ONLY=1. Loaded through FASTRTPS_DEFAULT_PROFILES_FILE (set in the Dockerfile).
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>shm_4mb</transport_id>
+            <type>SHM</type>
+            <segment_size>4194304</segment_size>
+        </transport_descriptor>
+        <transport_descriptor>
+            <transport_id>udp_loopback</transport_id>
+            <type>UDPv4</type>
+            <interfaceWhiteList>
+                <address>127.0.0.1</address>
+            </interfaceWhiteList>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="r_one_default" is_default_profile="true">
+        <rtps>
+            <userTransports>
+                <transport_id>shm_4mb</transport_id>
+                <transport_id>udp_loopback</transport_id>
+            </userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+</profiles>

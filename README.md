@@ -19,7 +19,7 @@ This table is the honest state of each feature. Anything not marked **Works** is
 
 | Feature | Status | Notes |
 |---|---|---|
-| YOLOv8 detection, lidar/depth ranging, TF projection to `odom` | Works (simulation) | Camera bearing is used directly as lidar bearing, so close, off-axis objects can be mis-ranged. Gazebo actors have no collisions, so the simulated lidar cannot see the people in the demo and simulation ranges with the depth camera instead |
+| YOLOv8 detection, lidar/depth ranging, TF projection to `odom` | Works (simulation) | Lidar ranging is tested only on synthetic scans. Gazebo actors have no collisions, so the simulated lidar cannot see the people in the demo and simulation ranges with the depth camera instead |
 | Velocity estimate and `STATIC`/`DYNAMIC` label | Experimental | New tracks are `UNKNOWN` until their motion is clear. Tuned on one recorded run and synthetic tests. A target slower than `speed_threshold` is labelled `STATIC` |
 | Persistent world model | Experimental | Only proven-static tracks enter it. Capped at 256 entries, least recently seen evicted first. Not yet kept across restarts |
 | World-space tracker and occlusion coasting | Experimental | See [World-Space Tracker](#world-space-tracker). Tracks end after 2.5 s without a match |
@@ -48,7 +48,7 @@ flowchart TD
     subgraph Perception ["Core Spatial Perception Node"]
         SYNC["message_filters.ApproximateTimeSynchronizer<br/>(80ms window tolerance)"]
         YOLO["YOLOv8<br/>(2D BBoxes)"]
-        GEOM["Range Lookup<br/>(5-beam median or 5x5 depth patch)"]
+        GEOM["Range Lookup<br/>(nearest lidar cluster in the box or depth patch)"]
         TRANS["TF2 Transform: sensor frame -> odom<br/>(Global Projection)"]
         KIN["World-Space Tracker<br/>(Kalman filter + Hungarian matching in odom)"]
         WM["Persistent World Model Memory<br/>(Object Permanence)"]
@@ -80,7 +80,7 @@ flowchart TD
 
 ## Key Capabilities
 
-1. **Approximate Time Sensor Synchronization:** Synchronizes `/camera/image_raw` with `/scan` or the depth image using `message_filters.ApproximateTimeSynchronizer` (slop: 80ms). Lidar ranges use a 5-beam median at the box centre, and depth ranges use a 5×5 median patch.
+1. **Approximate Time Sensor Synchronization:** Synchronizes `/camera/image_raw` with `/scan` or the depth image using `message_filters.ApproximateTimeSynchronizer` (slop: 80ms). Lidar beams are moved into the camera frame with the static TF and projected into the image. The beams inside a box are split at range jumps over 0.3 m, and the nearest group of at least 2 beams gives the range. Depth ranges use the nearest quartile of a patch over the middle third of the box. The depth image must be the same size as the colour image, and `16UC1` and `mono16` depth is read as millimetres.
 2. **Global Coordinates (TF2):** Projects detected objects into the global frame (`odom` or `map`). As the robot drives or rotates, stored static objects in `world_model` stay fixed in that frame (odometry itself drifts over time; use `map` with SLAM to bound it).
 3. **True Metric Kinematics & Velocity Projection:** Estimates each object's velocity in the fixed world frame with a Kalman filter. Publishes predicted footprints ($t = 0.5\text{s} \dots 2.0\text{s}$) as a standard `sensor_msgs/msg/PointCloud2`. `config/nav2_params.yaml` lists this topic as a costmap source, but no launch file starts Nav2 yet.
 4. **Interactive 3D RViz2 Displays:** Publishes standard `visualization_msgs/msg/MarkerArray` to `/perception/markers`:
@@ -118,6 +118,8 @@ The first build downloads the ROS 2 Humble desktop image and the Python dependen
 
 The image has the YOLOv8n weights built in, so it starts without network access. The build fails if NumPy, OpenCV, `cv_bridge` and `ultralytics` cannot be imported together.
 
+The image loads [docker/fastdds_profile.xml](docker/fastdds_profile.xml), which enlarges Fast DDS's shared memory so full-size camera images are not dropped ([why](docs/timing_2c.md#image-delivery)). It also keeps ROS traffic on this machine, so nodes on other computers cannot see the container's topics.
+
 ---
 
 ### Option 2: Native ROS 2 Humble (Ubuntu 22.04)
@@ -142,6 +144,11 @@ source install/setup.bash
 ```
 
 For a GPU, skip the `--index-url` option in step 3 so pip installs the default CUDA wheels.
+
+With the default Fast DDS middleware, the node can miss many camera images. To use the same transport settings as the Docker image, run this in each terminal before launching:
+```bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/ros2_ws/src/r_one/docker/fastdds_profile.xml
+```
 
 ---
 
@@ -257,14 +264,12 @@ ros2 param set /spatial_vision show_debug_window true
 
 ### Concurrency & Multi-Threaded Execution
 
-`SpatialVisionNode` is configured with `ReentrantCallbackGroup` and spins under a 4-thread `MultiThreadedExecutor`:
-- **Thread 1:** Sensor synchronization and camera image ingestion.
-- **Thread 2:** YOLOv8 neural network inference and world-space tracking.
-- **Thread 3:** TF2 coordinate transformation lookups and pinhole back-projection.
-- **Thread 4:** Publisher serialization (`PointCloud2`, `MarkerArray`, `Detection3DArray`, Diagnostics).
+`SpatialVisionNode` runs its callbacks in one `ReentrantCallbackGroup` under a 4-thread `MultiThreadedExecutor`, and does the heavy work on a worker thread of its own:
+- **Executor threads:** sensor and TF callbacks, the diagnostics timer and the services. The sync callback only converts the depth image and hands the frame set to the worker, so none of these wait for inference.
+- **Worker thread:** YOLO inference, ranging, TF projection, tracking, publishing and the debug window. It always takes the newest frame set. A frame that a newer one replaces before the worker reaches it is dropped and counted (`dropped_frames` in the run log).
+- Tracking, the world model and publishing hold a short state lock, which the diagnostics timer and the services also take.
 
-> [!NOTE]
-> The thread list above describes the intended split. In the current code, frame processing (including inference) runs under a single state lock, so diagnostics and service calls can wait while a frame is being processed. Moving inference out of the lock is planned.
+See [docs/timing_2c.md](docs/timing_2c.md) for the measurements.
 
 ---
 
@@ -327,7 +332,7 @@ ros2 service call /spatial_vision/reset_tracker std_srvs/srv/Trigger
 
 ### World-Space Tracker
 
-`SpatialVisionNode` tracks objects in `target_frame` with its own tracker ([tracking.py](r_one/r_one/tracking.py)). YOLO's ByteTrack IDs are ignored.
+`SpatialVisionNode` tracks objects in `target_frame` with its own tracker ([tracking.py](r_one/r_one/tracking.py)). YOLO runs in plain detection mode (`predict()`), without ByteTrack.
 - **Filter:** each track has a constant-velocity Kalman filter ($\mathbf{x} = [x, y, v_x, v_y]^T$) that uses the real time between frames.
 - **Matching:** each frame, tracks are matched to the ranged detections of the same class by Mahalanobis distance, using the Hungarian method. A track is published after its second match.
 - **Occlusion coasting:** an unmatched track keeps predicting, and its uncertainty grows. A moving track still feeds the costmap while it coasts. A track ends after 2.5 s without a match.

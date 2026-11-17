@@ -291,11 +291,12 @@ class TestMotion(unittest.TestCase):
                 self.assertLessEqual(first_dynamic, 42.97)
 
     def test_walker_first_seen_anywhere_on_its_path(self):
-        # Start the track every 0.1 s along the 9 s path. At 5 Hz every start meets the
-        # 1.5 s target (worst 1.3 s). At 2 Hz a few starts near a turn miss it (worst 1.7 s
-        # with these seeds, 2.2 s in wider sweeps), so 1.8 s is a regression bound there;
-        # the 1.5 s target belongs to stage 2c.
-        for rate_hz, bound in ((5.0, 1.5), (2.0, 1.8)):
+        # Start the track every 0.1 s along the 9 s path. The node runs at 4 Hz or more
+        # (stage 2c), and both 4 Hz and 5 Hz meet the 1.5 s target with these seeds (worst
+        # 1.4 s and 1.3 s). Over seeds 0-19, 4 Hz misses it on 6 of 1800 starts, all near a
+        # turn (worst 1.6 s); 5 Hz never does. At 2 Hz more starts near a turn miss (worst
+        # 1.7 s here, 2.2 s over seeds 0-19), so 1.8 s is only a regression bound there.
+        for rate_hz, bound in ((5.0, 1.5), (4.0, 1.5), (2.0, 1.8)):
             for seed in range(2):
                 with self.subTest(rate_hz=rate_hz, seed=seed):
                     delays = []

@@ -51,6 +51,9 @@ assert numpy.__version__.startswith('1.'), numpy.__version__; print('perception 
 COPY . src/r_one/
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build --symlink-install"
 
+# Larger Fast DDS shared-memory segment so full-size images are not dropped (docs/timing_2c.md)
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/home/ros/ros2_ws/src/r_one/docker/fastdds_profile.xml
+
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

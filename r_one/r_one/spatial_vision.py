@@ -24,10 +24,11 @@ import numpy as np
 from r_one import geometry, messages
 from r_one.detectors import ultralytics_detector
 from r_one.detectors.ultralytics_detector import resolve_model_path, UltralyticsDetector
+from r_one.frame_slot import FrameSlot
 from r_one.geometry import intrinsics_are_valid
 from r_one.messages import Detection3DArray, VISION_MSGS_AVAILABLE
 from r_one.parameters import PARAMETER_RULES, validate_parameter
-from r_one.run_log import RunLog, track_record
+from r_one.run_log import detection_record, RunLog, track_record
 from r_one.tracking import DYNAMIC, Measurement, Track, Tracker, TrackerConfig
 from r_one.world_model import WorldModel
 import rclpy
@@ -39,6 +40,7 @@ except ImportError:
     ExternalShutdownException = KeyboardInterrupt
     from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time as RosTime
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud2
 from std_srvs.srv import Trigger
@@ -69,6 +71,9 @@ except ImportError:
         SUCCESS = 0
         FAILURE = 1
         ERROR = 2
+
+
+DEBUG_WINDOW = "Robot's 3D Spatial Vision"
 
 
 def debug_window_supported() -> bool:
@@ -225,6 +230,10 @@ class SpatialVisionNode(LifecycleNode):
             qos_profile=sensor_qos,
             callback_group=self.cb_group,
         )
+        # Count every message each synced topic delivers, before the synchronizer pairs them
+        self.received = {'images_received': 0, 'range_msgs_received': 0}
+        self.received_lock = threading.Lock()
+        self.sub_img.registerCallback(self.count_received, 'images_received')
 
         if self.depth_source == 'depth_image':
             self.sub_depth = message_filters.Subscriber(
@@ -234,6 +243,7 @@ class SpatialVisionNode(LifecycleNode):
                 qos_profile=sensor_qos,
                 callback_group=self.cb_group,
             )
+            self.sub_depth.registerCallback(self.count_received, 'range_msgs_received')
             self.time_sync = message_filters.ApproximateTimeSynchronizer(
                 [self.sub_img, self.sub_depth],
                 queue_size=10,
@@ -251,6 +261,7 @@ class SpatialVisionNode(LifecycleNode):
                 qos_profile=sensor_qos,
                 callback_group=self.cb_group,
             )
+            self.sub_scan.registerCallback(self.count_received, 'range_msgs_received')
             self.time_sync = message_filters.ApproximateTimeSynchronizer(
                 [self.sub_img, self.sub_scan],
                 queue_size=10,
@@ -315,6 +326,10 @@ class SpatialVisionNode(LifecycleNode):
         self.world_marker_count = 0
 
         self.frame_counter = 0
+        self.dropped_frames = 0
+        self.tf_counts = {'tf_failures': 0}
+        # Scan-to-camera matrices, keyed by (scan frame, camera frame)
+        self.laser_camera_cache = {}
 
         # --- Autostart Lifecycle Support ---
         if LIFECYCLE_AVAILABLE and self.autostart:
@@ -323,6 +338,14 @@ class SpatialVisionNode(LifecycleNode):
                 self.trigger_activate()
             except Exception as e:
                 self.get_logger().debug(f"Lifecycle autostart transition: {e}")
+
+        # Inference runs on its own thread, so callbacks, TF and timers never wait for it
+        self.debug_window_open = False
+        self.frame_slot = FrameSlot()
+        self.worker = threading.Thread(
+            target=self.frame_worker, name='spatial_vision_worker', daemon=True
+        )
+        self.worker.start()
 
         self.get_logger().info(
             f"Spatial Vision initialized with target_frame: '{self.target_frame}'."
@@ -346,10 +369,17 @@ class SpatialVisionNode(LifecycleNode):
                 f"cx={self.cx:.2f}, cy={self.cy:.2f}"
             )
 
+    def count_received(self, msg, key: str):
+        # Subscription callbacks can run on several executor threads at once
+        with self.received_lock:
+            self.received[key] += 1
+
     def sync_lidar_callback(self, img_msg: Image, scan_msg: LaserScan):
-        self.process_perception_frame(
+        # The boxes come from the image, so place them with the image's stamp. The scan can
+        # be up to sync_slop older or newer.
+        self.submit_frame(
             img_msg=img_msg,
-            stamp=scan_msg.header.stamp,
+            stamp=img_msg.header.stamp,
             sensor_data=scan_msg,
             is_depth_image=False,
         )
@@ -370,16 +400,129 @@ class SpatialVisionNode(LifecycleNode):
             )
             return
 
-        if depth_msg.encoding == '16UC1':
+        if depth_msg.encoding in ('16UC1', 'mono16'):
             depth_array = depth_array / 1000.0  # mm to meters
 
-        self.process_perception_frame(
+        # Ranging reads the depth at the box's pixels, so both images must be the same size
+        if depth_array.shape[:2] != (img_msg.height, img_msg.width):
+            self.get_logger().error(
+                f"Skipping frame: the depth image is {depth_array.shape[1]}x"
+                f"{depth_array.shape[0]} but the colour image is "
+                f"{img_msg.width}x{img_msg.height}. Publish a depth image registered "
+                "to the colour camera.",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        # The boxes come from the colour image, so place them with its stamp, as in lidar mode
+        self.submit_frame(
             img_msg=img_msg,
-            stamp=depth_msg.header.stamp,
+            stamp=img_msg.header.stamp,
             sensor_data=depth_array,
             is_depth_image=True,
             depth_frame_id=depth_msg.header.frame_id,
         )
+
+    def submit_frame(self, **frame):
+        """Hand a synced frame set to the worker, keeping only every n-th and the newest."""
+        self.frame_counter += 1
+        if self.frame_counter % self.process_every_n != 0:
+            return
+        if self.frame_slot.put(frame):
+            self.dropped_frames += 1
+
+    def frame_worker(self):
+        """Warm up the detector, then process the newest frame until the slot closes."""
+        self.warm_up_detector()
+        try:
+            while not self.frame_slot.closed:
+                frame = self.frame_slot.take(timeout=0.5)
+                if frame is None:
+                    continue
+                try:
+                    self.sync_debug_window()
+                    self.process_perception_frame(**frame)
+                except Exception as exc:
+                    # The worker must survive, or the node would stay up and stop perceiving
+                    self.get_logger().error(
+                        f"Perception frame failed: {exc!r}", throttle_duration_sec=5.0
+                    )
+        finally:
+            if self.debug_window_open:
+                self.debug_window_open = False
+                cv2.destroyWindow(DEBUG_WINDOW)
+                cv2.waitKey(1)
+
+    def sync_debug_window(self):
+        """
+        Open or close the debug window to match show_debug_window.
+
+        Only the worker thread calls this and draws the window, so every OpenCV window
+        call happens on one thread.
+        """
+        if self.show_debug_window == self.debug_window_open:
+            return
+        if self.debug_window_open:
+            self.debug_window_open = False
+            cv2.destroyWindow(DEBUG_WINDOW)
+            cv2.waitKey(1)
+        elif debug_window_supported():
+            cv2.namedWindow(DEBUG_WINDOW, cv2.WINDOW_NORMAL)
+            self.debug_window_open = True
+        else:
+            self.show_debug_window = False
+            self.get_logger().warn(
+                "show_debug_window turned off: OpenCV or a display is missing."
+            )
+
+    def warm_up_detector(self):
+        """Run the detector once, so the first real frame does not pay for model setup."""
+        if self.detector is None:
+            return
+        start = time.perf_counter()
+        try:
+            self.detector.detect(np.zeros((480, 640, 3), dtype=np.uint8))
+        except Exception as exc:
+            self.get_logger().warn(f"Detector warm-up failed: {exc!r}")
+            return
+        self.get_logger().info(
+            f"Detector warmed up in {time.perf_counter() - start:.1f} s"
+        )
+
+    def laser_to_camera(self, scan_frame: str, camera_frame: str) -> Optional[np.ndarray]:
+        """
+        Return the 4×4 matrix that moves scan points into the camera frame, or None.
+
+        The lidar and the camera are both fixed to the robot, so this transform does not
+        change with time. It is looked up once, from the latest TF, and cached.
+        """
+        key = (scan_frame, camera_frame)
+        matrix = self.laser_camera_cache.get(key)
+        if matrix is not None:
+            return matrix
+        try:
+            transform = self.tf_buffer.lookup_transform(camera_frame, scan_frame, RosTime())
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(
+                f"No transform from '{scan_frame}' to '{camera_frame}' yet, so lidar "
+                f"detections are not ranged: {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return None
+        matrix = geometry.transform_to_matrix(transform.transform)
+        self.laser_camera_cache[key] = matrix
+        self.get_logger().info(f"Cached the '{scan_frame}' to '{camera_frame}' transform")
+        return matrix
+
+    def stop_worker(self):
+        """Stop the perception worker and wait for its current frame to finish."""
+        self.frame_slot.close()
+        if self.worker.is_alive() and self.worker is not threading.current_thread():
+            self.worker.join(timeout=10.0)
+
+    def destroy_node(self):
+        self.stop_worker()
+        return super().destroy_node()
 
     def process_perception_frame(
         self,
@@ -389,106 +532,113 @@ class SpatialVisionNode(LifecycleNode):
         is_depth_image: bool,
         depth_frame_id: Optional[str] = None,
     ):
-        self.frame_counter += 1
-        if self.frame_counter % self.process_every_n != 0:
-            return
-
         if self.fx is None or self.cx is None:
             return
 
         if self.detector is None or self.bridge is None:
             return
 
-        with self.state_lock:
-            start_time = time.perf_counter()
-            try:
-                cv_image = self.bridge.imgmsg_to_cv2(img_msg, 'bgr8')
-                detections = self.detector.detect(cv_image)
-            except Exception as exc:
-                self.get_logger().error(
-                    f"Skipping frame, detection failed: {exc}",
-                    throttle_duration_sec=5.0,
+        start_time = time.perf_counter()
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(img_msg, 'bgr8')
+            detections = self.detector.detect(cv_image)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Skipping frame, detection failed: {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        stamp_sec = stamp.sec + stamp.nanosec * 1e-9
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        if stamp_sec > 0.0:
+            self.last_sync_delta_ms = abs(now_sec - stamp_sec) * 1000.0
+            current_time = stamp_sec
+        else:
+            current_time = now_sec
+
+        if VISION_MSGS_AVAILABLE and self.detection_3d_pub is not None:
+            detection_3d_array = Detection3DArray()
+            detection_3d_array.header.frame_id = self.target_frame
+            detection_3d_array.header.stamp = stamp
+        else:
+            detection_3d_array = None
+
+        # Move the scan into the camera once per frame, so each box picks the beams that
+        # project into it
+        points_cam = None
+        if not is_depth_image:
+            camera_frame = img_msg.header.frame_id or 'camera_optical_link'
+            scan_frame = sensor_data.header.frame_id or 'laser_frame'
+            to_camera = self.laser_to_camera(scan_frame, camera_frame)
+            if to_camera is not None:
+                points_cam = geometry.transform_points(
+                    to_camera, geometry.scan_points(sensor_data)
                 )
-                return
 
-            stamp_sec = stamp.sec + stamp.nanosec * 1e-9
-            now_sec = self.get_clock().now().nanoseconds / 1e9
-            if stamp_sec > 0.0:
-                self.last_sync_delta_ms = abs(now_sec - stamp_sec) * 1000.0
-                current_time = stamp_sec
-            else:
-                current_time = now_sec
+        measurements: List[Measurement] = []
+        ranged: List[bool] = []
+        for detection in detections:
+            ranged.append(False)
+            x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
+            u = float((x1 + x2) / 2)
+            v = float((y1 + y2) / 2)
 
-            if VISION_MSGS_AVAILABLE and self.detection_3d_pub is not None:
-                detection_3d_array = Detection3DArray()
-                detection_3d_array.header.frame_id = self.target_frame
-                detection_3d_array.header.stamp = stamp
-            else:
-                detection_3d_array = None
-
-            measurements: List[Measurement] = []
-            for detection in detections:
-                x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
-                u = float((x1 + x2) / 2)
-                v = float((y1 + y2) / 2)
-
-                if is_depth_image:
-                    # Sample the middle third of the box
-                    distance = geometry.extract_depth_image_distance(
-                        u,
-                        v,
-                        sensor_data,
-                        half_width=float(x2 - x1) / 6.0,
-                        half_height=float(y2 - y1) / 6.0,
-                    )
-                    if distance is None:
-                        continue
-                    local_x = (u - self.cx) * distance / self.fx
-                    local_y = (v - self.cy) * distance / self.fy
-                    local_z = distance
-                    source_frame = (
-                        depth_frame_id
-                        if depth_frame_id
-                        else 'camera_optical_link'
-                    )
-                else:
-                    angle_rad = math.atan((self.cx - u) / self.fx)
-                    distance = geometry.extract_lidar_distance(
-                        angle_rad, sensor_data
-                    )
-                    if distance is None:
-                        continue
-                    local_x = distance * math.cos(angle_rad)
-                    local_y = distance * math.sin(angle_rad)
-                    local_z = 0.0
-                    source_frame = (
-                        sensor_data.header.frame_id
-                        if sensor_data.header.frame_id
-                        else 'laser_frame'
-                    )
-
-                global_pt = geometry.transform_point(
-                    self.tf_buffer,
-                    self.target_frame,
-                    local_x,
-                    local_y,
-                    local_z,
-                    source_frame,
-                    stamp,
-                    self.get_logger(),
+            if is_depth_image:
+                # Sample the middle third of the box
+                distance = geometry.extract_depth_image_distance(
+                    u,
+                    v,
+                    sensor_data,
+                    half_width=float(x2 - x1) / 6.0,
+                    half_height=float(y2 - y1) / 6.0,
                 )
-                if global_pt is None:
+                if distance is None:
                     continue
-
-                measurements.append(Measurement(
-                    global_pt.x,
-                    global_pt.y,
-                    global_pt.z,
-                    detection.class_name,
-                    detection.score,
-                    (float(x1), float(y1), float(x2), float(y2)),
+                local_x = (u - self.cx) * distance / self.fx
+                local_y = (v - self.cy) * distance / self.fy
+                local_z = distance
+                source_frame = (
+                    depth_frame_id
+                    if depth_frame_id
+                    else 'camera_optical_link'
+                )
+            else:
+                if points_cam is None:
+                    continue
+                centroid = geometry.nearest_cluster(geometry.points_in_box(
+                    points_cam, (x1, y1, x2, y2), self.fx, self.fy, self.cx, self.cy
                 ))
+                if centroid is None:
+                    continue
+                local_x, local_y, local_z = (float(value) for value in centroid)
+                source_frame = camera_frame
 
+            global_pt = geometry.transform_point(
+                self.tf_buffer,
+                self.target_frame,
+                local_x,
+                local_y,
+                local_z,
+                source_frame,
+                stamp,
+                self.get_logger(),
+                self.tf_counts,
+            )
+            if global_pt is None:
+                continue
+
+            ranged[-1] = True
+            measurements.append(Measurement(
+                global_pt.x,
+                global_pt.y,
+                global_pt.z,
+                detection.class_name,
+                detection.score,
+                (float(x1), float(y1), float(x2), float(y2)),
+            ))
+
+        with self.state_lock:
             tracks = self.tracker.step(current_time, measurements)
             for track in tracks:
                 self.world_model.observe(track, current_time)
@@ -561,16 +711,8 @@ class SpatialVisionNode(LifecycleNode):
             ):
                 self.detection_3d_pub.publish(detection_3d_array)
 
-            if self.show_debug_window and not debug_window_supported():
-                self.show_debug_window = False
-                self.get_logger().warn(
-                    "show_debug_window turned off: OpenCV or a display is missing."
-                )
-
-            if self.show_debug_window:
-                annotated_frame = self.detector.plot()
-                cv2.namedWindow("Robot's 3D Spatial Vision", cv2.WINDOW_NORMAL)
-                cv2.imshow("Robot's 3D Spatial Vision", annotated_frame)
+            if self.debug_window_open:
+                cv2.imshow(DEBUG_WINDOW, self.detector.plot())
                 cv2.waitKey(1)
 
             cycle_dt = time.perf_counter() - start_time
@@ -582,6 +724,13 @@ class SpatialVisionNode(LifecycleNode):
             self.run_log.write_frame(
                 current_time, cycle_dt, [track_record(track) for track in tracks],
                 self.world_model,
+                [detection_record(d, r) for d, r in zip(detections, ranged)],
+                {
+                    **self.received,
+                    'synced_frames': self.frame_counter,
+                    'dropped_frames': self.dropped_frames,
+                    **self.tf_counts,
+                },
             )
 
     def parameters_callback(self, params):
@@ -724,6 +873,7 @@ class SpatialVisionNode(LifecycleNode):
 
     def on_shutdown(self, state):
         self.get_logger().info("Lifecycle: on_shutdown called.")
+        self.stop_worker()
         self.run_log.close()
         if hasattr(super(), 'on_shutdown'):
             return super().on_shutdown(state)
@@ -745,9 +895,10 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # Stop the worker first: it owns the debug window, and this runs on another thread
+        node.destroy_node()
         if cv2 is not None:
             cv2.destroyAllWindows()
-        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

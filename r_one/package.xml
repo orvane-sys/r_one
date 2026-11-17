@@ -28,7 +28,7 @@
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
-  <!-- ultralytics, lapx and torch are not in rosdep: see requirements.txt -->
+  <!-- ultralytics and torch are not in rosdep: see requirements.txt -->
 
   <!-- Bag recording and download scripts installed with this package -->
   <exec_depend>ros2bag</exec_depend>
