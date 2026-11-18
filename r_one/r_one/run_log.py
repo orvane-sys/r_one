@@ -18,6 +18,7 @@ def track_record(track):
         'vy': vy,
         'state': track.motion,
         'box': list(track.measurement.box),
+        'size': list(track.measurement.size),
     }
 
 

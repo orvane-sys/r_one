@@ -8,8 +8,8 @@ import unittest
 
 import numpy as np
 from r_one.tracking import (
-    ConstantVelocityFilter, DYNAMIC, Measurement, STATIC, Track, Tracker, TrackerConfig,
-    UNKNOWN,
+    COASTING, CONFIRMED, ConstantVelocityFilter, DYNAMIC, Measurement, STATIC, TENTATIVE,
+    Track, Tracker, TrackerConfig, UNKNOWN,
 )
 from r_one.world_model import WorldModel
 
@@ -247,6 +247,41 @@ class TestLifecycle(unittest.TestCase):
             tracker.step(step * 0.2, points)
             self.assertLessEqual(len(tracker.tracks), TrackerConfig().max_tracks)
         self.assertEqual(tracker._next_id, 10001)
+
+    def test_lifecycle_goes_tentative_confirmed_coasting(self):
+        tracker = Tracker()
+        tracker.step(0.0, [person(1.0, 1.0)])
+        track = tracker.tracks[0]
+        self.assertEqual(tracker.lifecycle(track), TENTATIVE)
+        tracker.step(0.2, [person(1.0, 1.0)])
+        self.assertEqual(tracker.lifecycle(track), CONFIRMED)
+        tracker.step(0.4, [])
+        self.assertEqual(tracker.lifecycle(track), COASTING)
+        tracker.step(0.6, [person(1.0, 1.0)])
+        self.assertEqual(tracker.lifecycle(track), CONFIRMED)
+
+    def test_unmatched_new_track_stays_tentative(self):
+        tracker = Tracker()
+        tracker.step(0.0, [person(1.0, 1.0)])
+        tracker.step(0.2, [])
+        self.assertEqual(tracker.lifecycle(tracker.tracks[0]), TENTATIVE)
+
+    def test_ended_track_is_not_returned(self):
+        tracker = Tracker()
+        tracker.step(0.0, [person(1.0, 1.0)])
+        tracker.step(0.2, [person(1.0, 1.0)])
+        tracker.step(2.0, [])
+        self.assertEqual(tracker.lifecycle(tracker.tracks[0]), COASTING)
+        returned = tracker.step(2.8, [])
+        self.assertEqual(tracker.ended_ids(), [1])
+        self.assertEqual(returned, [])
+        self.assertEqual(tracker.tracks, [])
+        self.assertEqual(tracker.coasting_dynamic(), [])
+
+    def test_measurement_size_defaults_to_unknown(self):
+        self.assertEqual(person(1.0, 1.0).size, ())
+        sized = Measurement(1.0, 1.0, 0.0, 'person', 0.9, size=(0.5, 0.5, 1.7))
+        self.assertEqual(sized.size, (0.5, 0.5, 1.7))
 
     def test_reset_forgets_everything(self):
         tracker = Tracker()

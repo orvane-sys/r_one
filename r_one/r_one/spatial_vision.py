@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
 import math
 import os
@@ -29,8 +30,11 @@ from r_one.geometry import intrinsics_are_valid
 from r_one.messages import Detection3DArray, VISION_MSGS_AVAILABLE
 from r_one.parameters import PARAMETER_RULES, validate_parameter
 from r_one.run_log import detection_record, RunLog, track_record
-from r_one.tracking import DYNAMIC, Measurement, Track, Tracker, TrackerConfig
+from r_one.tracking import (
+    COASTING, CONFIRMED, DYNAMIC, Measurement, TENTATIVE, Track, Tracker, TrackerConfig,
+)
 from r_one.world_model import WorldModel
+from r_one_msgs.msg import TrackArray
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -74,6 +78,10 @@ except ImportError:
 
 
 DEBUG_WINDOW = "Robot's 3D Spatial Vision"
+# Diagnostics report frames finished per second over this window, and WARN below the minimum
+# (the p95 rate gate, docs/timing_2c.md)
+THROUGHPUT_WINDOW_S = 5.0
+MIN_THROUGHPUT_HZ = 2.0
 
 
 def debug_window_supported() -> bool:
@@ -279,6 +287,11 @@ class SpatialVisionNode(LifecycleNode):
             PointCloud2, 'perception/dynamic_costmap_obstacles', costmap_qos
         )
 
+        # Every live track with its lifecycle state, published every processed frame
+        self.track_pub = self.create_publisher(
+            TrackArray, 'perception/tracks', output_qos
+        )
+
         if VISION_MSGS_AVAILABLE:
             self.detection_3d_pub = self.create_publisher(
                 Detection3DArray, 'perception/detections_3d', output_qos
@@ -308,6 +321,10 @@ class SpatialVisionNode(LifecycleNode):
         self.last_inference_latency: float = 0.0
         self.cycle_times: List[float] = []
         self.last_sync_delta_ms: float = 0.0
+        # Wall-clock times of finished frames over the last THROUGHPUT_WINDOW_S
+        self.finished_frames = deque()
+        self.first_finished_frame: Optional[float] = None
+        self.last_range_gap_ms: float = 0.0
         if DIAGNOSTICS_AVAILABLE:
             self.diag_pub = self.create_publisher(
                 DiagnosticArray, '/diagnostics', 10
@@ -382,6 +399,7 @@ class SpatialVisionNode(LifecycleNode):
             stamp=img_msg.header.stamp,
             sensor_data=scan_msg,
             is_depth_image=False,
+            range_stamp=scan_msg.header.stamp,
         )
 
     def sync_depth_callback(self, img_msg: Image, depth_msg: Image):
@@ -421,6 +439,7 @@ class SpatialVisionNode(LifecycleNode):
             sensor_data=depth_array,
             is_depth_image=True,
             depth_frame_id=depth_msg.header.frame_id,
+            range_stamp=depth_msg.header.stamp,
         )
 
     def submit_frame(self, **frame):
@@ -531,6 +550,7 @@ class SpatialVisionNode(LifecycleNode):
         sensor_data,
         is_depth_image: bool,
         depth_frame_id: Optional[str] = None,
+        range_stamp=None,
     ):
         if self.fx is None or self.cx is None:
             return
@@ -629,13 +649,15 @@ class SpatialVisionNode(LifecycleNode):
                 continue
 
             ranged[-1] = True
+            box = (float(x1), float(y1), float(x2), float(y2))
             measurements.append(Measurement(
                 global_pt.x,
                 global_pt.y,
                 global_pt.z,
                 detection.class_name,
                 detection.score,
-                (float(x1), float(y1), float(x2), float(y2)),
+                box,
+                geometry.measured_size(box, local_z, self.fx, self.fy),
             ))
 
         with self.state_lock:
@@ -660,6 +682,7 @@ class SpatialVisionNode(LifecycleNode):
                     vel_x,
                     vel_y,
                     stamp,
+                    size=track.measurement.size,
                 )
                 if detection_3d_array is not None:
                     messages.append_detection_3d(
@@ -670,6 +693,7 @@ class SpatialVisionNode(LifecycleNode):
                         track.measurement.score,
                         point,
                         stamp,
+                        size=track.measurement.size,
                     )
                 self.get_logger().debug(
                     f"[{track.motion}] ID:{track.id} {track.class_name.upper()} | "
@@ -699,17 +723,17 @@ class SpatialVisionNode(LifecycleNode):
             if marker_array.markers:
                 self.marker_pub.publish(marker_array)
 
-            if dynamic_costmap_points:
-                cloud_msg = messages.build_pointcloud2(
-                    dynamic_costmap_points, self.target_frame, stamp
-                )
-                self.costmap_obstacle_pub.publish(cloud_msg)
-
-            if (
-                detection_3d_array is not None
-                and len(detection_3d_array.detections) > 0
-            ):
+            # The cloud, 3D detections and tracks go out every frame, empty when there is
+            # nothing, so consumers drop what has gone. Nav2's ObstacleLayer still keeps its
+            # marks until a clearing source raytraces through them (docs/outputs_2e.md).
+            self.costmap_obstacle_pub.publish(messages.build_pointcloud2(
+                dynamic_costmap_points, self.target_frame, stamp
+            ))
+            if detection_3d_array is not None:
                 self.detection_3d_pub.publish(detection_3d_array)
+            self.track_pub.publish(messages.build_track_array(
+                self.tracker, self.tracker.tracks, self.target_frame, stamp, current_time
+            ))
 
             if self.debug_window_open:
                 cv2.imshow(DEBUG_WINDOW, self.detector.plot())
@@ -720,6 +744,13 @@ class SpatialVisionNode(LifecycleNode):
             self.cycle_times.append(cycle_dt)
             if len(self.cycle_times) > 30:
                 self.cycle_times.pop(0)
+            finished = time.monotonic()
+            self.finished_frames.append(finished)
+            if self.first_finished_frame is None:
+                self.first_finished_frame = finished
+            if range_stamp is not None:
+                range_sec = range_stamp.sec + range_stamp.nanosec * 1e-9
+                self.last_range_gap_ms = abs(stamp_sec - range_sec) * 1000.0
 
             self.run_log.write_frame(
                 current_time, cycle_dt, [track_record(track) for track in tracks],
@@ -780,21 +811,39 @@ class SpatialVisionNode(LifecycleNode):
         status.hardware_id = "intel_cpu_spatial_vision"
 
         with self.state_lock:
+            now = time.monotonic()
+            while self.finished_frames and self.finished_frames[0] < now - THROUGHPUT_WINDOW_S:
+                self.finished_frames.popleft()
+            throughput_hz = len(self.finished_frames) / THROUGHPUT_WINDOW_S
+            # The rate needs a full window of history before it can be judged
+            rate_known = (
+                self.first_finished_frame is not None
+                and now - self.first_finished_frame >= THROUGHPUT_WINDOW_S
+            )
             if not self.cycle_times:
                 fps = 0.0
                 status.level = DiagnosticStatus.OK
                 status.message = "Awaiting sensor stream"
             else:
                 fps = len(self.cycle_times) / sum(self.cycle_times)
-                if self.last_inference_latency > 100.0 or (0.0 < fps < 10.0):
+                if self.last_inference_latency > 100.0:
                     status.level = DiagnosticStatus.WARN
                     status.message = (
                         f"High latency: {self.last_inference_latency:.1f}ms "
-                        f"({fps:.1f} FPS)"
+                        f"({throughput_hz:.1f} Hz)"
+                    )
+                elif rate_known and throughput_hz < MIN_THROUGHPUT_HZ:
+                    status.level = DiagnosticStatus.WARN
+                    status.message = (
+                        f"Low rate: {throughput_hz:.1f} Hz over the last "
+                        f"{THROUGHPUT_WINDOW_S:.0f} s"
                     )
                 else:
                     status.level = DiagnosticStatus.OK
                     status.message = "Nominal operation"
+
+            states = [self.tracker.lifecycle(track) for track in self.tracker.tracks]
+            dynamic = sum(track.motion == DYNAMIC for track in self.tracker.tracks)
 
             status.values = [
                 KeyValue(key="fps", value=f"{fps:.2f}"),
@@ -814,7 +863,20 @@ class SpatialVisionNode(LifecycleNode):
                 KeyValue(
                     key="sync_delta_ms", value=f"{self.last_sync_delta_ms:.2f}"
                 ),
+                KeyValue(key="throughput_hz", value=f"{throughput_hz:.2f}"),
+                KeyValue(key="rgb_range_gap_ms", value=f"{self.last_range_gap_ms:.2f}"),
+                KeyValue(key="tentative_tracks", value=str(states.count(TENTATIVE))),
+                KeyValue(key="confirmed_tracks", value=str(states.count(CONFIRMED))),
+                KeyValue(key="coasting_tracks", value=str(states.count(COASTING))),
+                KeyValue(key="dynamic_tracks", value=str(dynamic)),
+                KeyValue(key="dropped_frames", value=str(self.dropped_frames)),
+                KeyValue(key="tf_failures", value=str(self.tf_counts['tf_failures'])),
             ]
+            with self.received_lock:
+                status.values.extend(
+                    KeyValue(key=key, value=str(count))
+                    for key, count in self.received.items()
+                )
 
         diag_array.status.append(status)
         self.diag_pub.publish(diag_array)

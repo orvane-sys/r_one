@@ -84,7 +84,7 @@ flowchart TD
 2. **Global Coordinates (TF2):** Projects detected objects into the global frame (`odom` or `map`). As the robot drives or rotates, stored static objects in `world_model` stay fixed in that frame (odometry itself drifts over time; use `map` with SLAM to bound it).
 3. **True Metric Kinematics & Velocity Projection:** Estimates each object's velocity in the fixed world frame with a Kalman filter. Publishes predicted footprints ($t = 0.5\text{s} \dots 2.0\text{s}$) as a standard `sensor_msgs/msg/PointCloud2`. `config/nav2_params.yaml` lists this topic as a costmap source, but no launch file starts Nav2 yet.
 4. **Interactive 3D RViz2 Displays:** Publishes standard `visualization_msgs/msg/MarkerArray` to `/perception/markers`:
-   - **3D Bounding Cubes**: Color-coded green (`STATIC`) and orange (`DYNAMIC`).
+   - **3D Bounding Cubes**: Color-coded green (`STATIC`) and orange (`DYNAMIC`). Each cube is sized from the detection box and its range: width = box width × range ÷ $f_x$, height = box height × range ÷ $f_y$, and depth is assumed equal to the width, because the camera cannot see it. The cube is centred on the measured point. When the size is unknown, the cube is 0.45 × 0.45 × 0.50 m.
    - **Floating HUD Text**: Object class, tracking ID, state, and metric speed in m/s.
    - **Velocity Vectors & Trajectory Paths**: Directional 3D arrows and lookahead line strips indicating moving target trajectories.
    - **Memory Cylinders**: Visualizes remembered static objects even when outside the camera field of view.
@@ -282,11 +282,18 @@ ros2 topic echo /diagnostics
 ```
 
 **Monitored Metrics:**
+- `throughput_hz`: Frames finished in the last 5 s, divided by 5. It falls to 0 when frames stop.
 - `fps`: 1 ÷ average processing time. This is the rate the pipeline could reach, not the rate it is running at.
-- `latency_ms`: Cycle time per inference and tracking step. Automatically elevates status to `WARN` if latency exceeds 100 ms ($<10$ FPS).
+- `latency_ms`: Cycle time per inference and tracking step.
 - `active_tracks`: Live tracks, including unconfirmed ones and ones coasting through an occlusion. Capped at 64.
+- `tentative_tracks`, `confirmed_tracks`, `coasting_tracks`: `active_tracks` split by lifecycle state, as on `perception/tracks`.
+- `dynamic_tracks`: Live tracks that are `DYNAMIC`.
 - `world_model_objects`: Count of static spatial entities retained in global coordinates.
 - `sync_delta_ms`: Age of the last processed frame (clock time minus sensor stamp), not the gap between the two sensors.
+- `rgb_range_gap_ms`: Gap between the colour image stamp and the depth image or scan stamp of the last processed frame.
+- `images_received`, `range_msgs_received`, `dropped_frames`, `tf_failures`: Running totals of images and range messages received, synced frames replaced before the worker took them, and detections dropped because TF had no transform at the image stamp.
+
+The status is `WARN` when latency is over 100 ms, or when `throughput_hz` is under 2 Hz once frames have been arriving for 5 s.
 
 ---
 
@@ -352,6 +359,7 @@ ros2 run r_one spatial_vision_node --ros-args -r __ns:=/robot_1
 # Topics resolve cleanly to:
 #   /robot_1/camera/image_raw
 #   /robot_1/perception/markers
+#   /robot_1/perception/tracks
 #   /robot_1/perception/detections_3d
 #   /robot_1/perception/dynamic_costmap_obstacles
 ```
@@ -370,11 +378,15 @@ ros2 run r_one spatial_vision_node --ros-args -r __ns:=/robot_1
 | `camera/depth/image_raw` | `sensor_msgs/msg/Image` | Subscribed | Best Effort, Volatile, Depth=5 | Depth image stream (when `depth_source: depth_image`) |
 | `/tf`, `/tf_static` | `tf2_msgs/msg/TFMessage` | Subscribed | Dynamic | Dynamic and static coordinate transforms |
 | `perception/markers` | `visualization_msgs/msg/MarkerArray` | Published | Reliable, Volatile, Depth=10 | 3D bounding boxes, HUD text, velocity vectors, world model |
-| `perception/detections_3d` | `vision_msgs/msg/Detection3DArray` | Published | Reliable, Volatile, Depth=10 | Standard ROS 2 3D detections for Nav2 / autonomous planners |
-| `perception/dynamic_costmap_obstacles` | `sensor_msgs/msg/PointCloud2` | Published | Best Effort, Volatile, Depth=5 | Projected future obstacle footprint points for Nav2 dynamic costmap |
-| `/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | Published | Reliable, Volatile, Depth=10 | System health telemetry (FPS, cycle latency, active tracks) |
+| `perception/tracks` | `r_one_msgs/msg/TrackArray` | Published | Reliable, Volatile, Depth=10 | Every live track with its state (`TENTATIVE`, `CONFIRMED`, `COASTING`), motion, position, velocity, size and covariance. Empty when nothing is tracked |
+| `perception/detections_3d` | `vision_msgs/msg/Detection3DArray` | Published | Reliable, Volatile, Depth=10 | Confirmed tracks matched in this frame, as standard 3D detections. Empty when there are none |
+| `perception/dynamic_costmap_obstacles` | `sensor_msgs/msg/PointCloud2` | Published | Best Effort, Volatile, Depth=5 | Predicted footprint points of moving tracks. Empty when nothing moves (see the note below) |
+| `/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | Published | Reliable, Volatile, Depth=10 | System health telemetry (throughput, latency, track counts) |
 | `robot_alerts` | `std_msgs/msg/String` | Published | Reliable, Volatile, Depth=10 | Safety zone warnings (`SAFE_PROCEED`, `CAUTION_SLOW_DOWN`, `HIGH_RISK_STOP`) |
 | `cmd_vel_fusion` | `geometry_msgs/msg/Twist` | Published | Reliable, Volatile, Depth=10 | Prototype emergency-braking commands (not consumed by any launch file, see status table) |
+
+> [!NOTE]
+> The perception outputs are published on every processed frame, empty when there is nothing to report, so a consumer can drop objects that have gone. Nav2's `ObstacleLayer` does not clear on an empty cloud: it keeps its marks until a clearing source, such as the laser scan, raytraces through them. A costmap layer that repaints from `perception/tracks` is planned. See [docs/outputs_2e.md](docs/outputs_2e.md).
 
 ### Services
 

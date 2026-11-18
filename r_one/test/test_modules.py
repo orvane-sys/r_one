@@ -17,6 +17,8 @@ from visualization_msgs.msg import MarkerArray
 
 from r_one import geometry, messages
 from r_one.detectors import Detection, ultralytics_detector
+from r_one.tracking import Measurement, Tracker
+from r_one_msgs.msg import Track as TrackMsg
 
 STAMP = Time().to_msg()
 
@@ -182,6 +184,23 @@ class TestPointsInBox(unittest.TestCase):
         self.assertEqual(kept.shape, (0, 3))
 
 
+class TestMeasuredSize(unittest.TestCase):
+    def test_box_and_range_give_width_depth_height(self):
+        size = geometry.measured_size((100.0, 50.0, 200.0, 250.0), 2.0, 400.0, 400.0)
+        np.testing.assert_allclose(size, (0.5, 0.5, 1.0))
+
+    def test_unknown_size_is_empty(self):
+        for box, range_m in (
+            ((100.0, 50.0, 200.0, 250.0), 0.0),
+            ((100.0, 50.0, 200.0, 250.0), -1.0),
+            ((100.0, 50.0, 200.0, 250.0), float('nan')),
+            ((100.0, 50.0, 100.0, 250.0), 2.0),
+            ((100.0, 250.0, 200.0, 50.0), 2.0),
+            ((), 2.0),
+        ):
+            self.assertEqual(geometry.measured_size(box, range_m, 400.0, 400.0), ())
+
+
 class TestNearestCluster(unittest.TestCase):
     def test_legs_with_a_gap_range_the_person_not_the_wall(self):
         # Two legs 1.0 m in front of the camera and 0.2 m apart, a wall at 4 m behind and
@@ -276,6 +295,27 @@ class TestMessages(unittest.TestCase):
         )
         self.assertTrue(all(marker.header.frame_id == 'odom' for marker in markers.markers))
 
+    def test_unknown_size_keeps_the_default_box(self):
+        markers = MarkerArray()
+        messages.append_markers(
+            markers, 'odom', 3, 3, 'person', 'STATIC', Point(z=1.0), 0.0, 0.0, 0.0, STAMP
+        )
+        cube, text = markers.markers
+        self.assertEqual((cube.scale.x, cube.scale.y, cube.scale.z), (0.45, 0.45, 0.50))
+        self.assertAlmostEqual(cube.pose.position.z, 1.25)
+        self.assertAlmostEqual(text.pose.position.z, 1.65)
+
+    def test_measured_size_is_centred_on_the_point(self):
+        markers = MarkerArray()
+        messages.append_markers(
+            markers, 'odom', 3, 3, 'person', 'STATIC', Point(z=1.0), 0.0, 0.0, 0.0, STAMP,
+            size=(0.5, 0.5, 1.7),
+        )
+        cube, text = markers.markers
+        np.testing.assert_allclose((cube.scale.x, cube.scale.y, cube.scale.z), (0.5, 0.5, 1.7))
+        self.assertAlmostEqual(cube.pose.position.z, 1.0)
+        self.assertAlmostEqual(text.pose.position.z, 1.0 + 0.85 + 0.15)
+
     def test_moving_object_also_gets_its_predicted_path(self):
         markers = MarkerArray()
         messages.append_markers(
@@ -299,6 +339,79 @@ class TestMessages(unittest.TestCase):
         self.assertEqual((detection.id, detection.header.frame_id), ('7', 'odom'))
         self.assertEqual(detection.results[0].hypothesis.class_id, 'person')
         self.assertAlmostEqual(detection.bbox.center.position.x, 1.0)
+        self.assertAlmostEqual(detection.bbox.center.position.z, 0.25)
+        self.assertAlmostEqual(detection.bbox.size.z, 0.50)
+
+    @unittest.skipUnless(messages.VISION_MSGS_AVAILABLE, 'vision_msgs is not installed')
+    def test_detection_3d_uses_the_measured_size(self):
+        array = messages.Detection3DArray()
+        messages.append_detection_3d(
+            array, 'odom', 7, 'person', 0.8, Point(x=1.0, z=0.9), STAMP, size=(0.5, 0.5, 1.7)
+        )
+        bbox = array.detections[0].bbox
+        self.assertAlmostEqual(bbox.center.position.z, 0.9)
+        np.testing.assert_allclose((bbox.size.x, bbox.size.y, bbox.size.z), (0.5, 0.5, 1.7))
+
+
+class TestTrackArray(unittest.TestCase):
+    def two_track_scene(self):
+        """Track a walker matched every frame and a chair last seen at 0.2 s."""
+        tracker = Tracker()
+        for step in range(10):
+            t = step * 0.2
+            seen = [Measurement(0.0, t, 0.3, 'person', 0.9, size=(0.5, 0.5, 1.7))]
+            if step < 2:
+                seen.append(Measurement(5.0, 5.0, 0.0, 'chair', 0.6))
+            tracker.step(t, seen)
+        return tracker
+
+    def test_every_field_is_filled(self):
+        tracker = self.two_track_scene()
+        array = messages.build_track_array(tracker, tracker.tracks, 'odom', STAMP, 1.8)
+        self.assertEqual(array.header.frame_id, 'odom')
+        walker, chair = array.tracks
+
+        self.assertEqual((walker.id, walker.class_name), (1, 'person'))
+        self.assertAlmostEqual(walker.score, 0.9)
+        self.assertEqual(walker.state, TrackMsg.STATE_CONFIRMED)
+        self.assertEqual(walker.motion, TrackMsg.MOTION_DYNAMIC)
+        self.assertAlmostEqual(walker.position.y, 1.8, delta=0.1)
+        self.assertAlmostEqual(walker.position.z, 0.3)
+        self.assertAlmostEqual(walker.velocity.y, 1.0, delta=0.15)
+        self.assertEqual((walker.size.x, walker.size.y, walker.size.z), (0.5, 0.5, 1.7))
+        self.assertAlmostEqual(walker.age_s, 1.8)
+        self.assertAlmostEqual(walker.time_since_update_s, 0.0)
+
+        self.assertEqual((chair.id, chair.class_name), (2, 'chair'))
+        self.assertEqual(chair.state, TrackMsg.STATE_COASTING)
+        self.assertEqual(chair.motion, TrackMsg.MOTION_UNKNOWN)
+        self.assertEqual((chair.size.x, chair.size.y, chair.size.z), (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(chair.age_s, 1.8)
+        self.assertAlmostEqual(chair.time_since_update_s, 1.6)
+
+    def test_covariance_is_row_major(self):
+        tracker = self.two_track_scene()
+        # A real covariance is symmetric, which would hide a transposed copy
+        tracker.tracks[0].filter.P = np.arange(16.0).reshape(4, 4)
+        array = messages.build_track_array(tracker, tracker.tracks, 'odom', STAMP, 1.8)
+        covariance = list(array.tracks[0].covariance)
+        self.assertEqual(len(covariance), 16)
+        self.assertEqual(covariance[2], 2.0)  # P[0, 2]
+        self.assertEqual(covariance[8], 8.0)  # P[2, 0]
+        self.assertEqual(covariance, [float(value) for value in range(16)])
+
+    def test_tentative_track_is_reported(self):
+        tracker = Tracker()
+        tracker.step(0.0, [Measurement(1.0, 1.0, 0.0, 'person', 0.9)])
+        array = messages.build_track_array(tracker, tracker.tracks, 'odom', STAMP, 0.0)
+        self.assertEqual([track.state for track in array.tracks], [TrackMsg.STATE_TENTATIVE])
+
+    def test_no_tracks_gives_an_empty_list_with_a_header(self):
+        tracker = Tracker()
+        array = messages.build_track_array(tracker, tracker.tracks, 'odom', STAMP, 0.0)
+        self.assertEqual(array.tracks, [])
+        self.assertEqual(array.header.frame_id, 'odom')
+        self.assertEqual(array.header.stamp, STAMP)
 
 
 if __name__ == '__main__':

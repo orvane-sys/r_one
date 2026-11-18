@@ -17,6 +17,11 @@ UNKNOWN = 'UNKNOWN'
 STATIC = 'STATIC'
 DYNAMIC = 'DYNAMIC'
 
+# Lifecycle states, named as in r_one_msgs/Track
+TENTATIVE = 'TENTATIVE'
+CONFIRMED = 'CONFIRMED'
+COASTING = 'COASTING'
+
 # Pairs that must not match get this cost, so the assignment still has a finite solution.
 NO_MATCH = 1e9
 
@@ -60,6 +65,8 @@ class Measurement:
     class_name: str
     score: float
     box: Tuple[float, ...] = ()
+    # Measured (width, depth, height) in metres, or empty when unknown
+    size: Tuple[float, ...] = ()
 
 
 class ConstantVelocityFilter:
@@ -221,6 +228,19 @@ class Tracker:
             and track.hits >= self.config.confirm_hits
             and track.motion == DYNAMIC
         ]
+
+    def lifecycle(self, track: Track) -> str:
+        """
+        Return the track's lifecycle state.
+
+        TENTATIVE until it has enough hits, then CONFIRMED if the last frame matched it,
+        otherwise COASTING.
+        """
+        if track.hits < self.config.confirm_hits:
+            return TENTATIVE
+        if track.id in self._matched_ids:
+            return CONFIRMED
+        return COASTING
 
     def ended_ids(self) -> List[int]:
         """Return the IDs of the tracks that ended in the last frame."""
