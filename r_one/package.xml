@@ -19,6 +19,7 @@
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>r_one_msgs</exec_depend>
 
   <!-- Perception node -->
   <exec_depend>cv_bridge</exec_depend>

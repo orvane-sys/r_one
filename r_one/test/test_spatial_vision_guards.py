@@ -1,5 +1,6 @@
 """Regression tests for the failure modes that used to kill or stall spatial_vision."""
 
+from collections import deque
 import os
 import threading
 import time
@@ -26,8 +27,9 @@ from r_one.spatial_vision import (
     SpatialVisionNode,
     validate_parameter,
 )
-from r_one.tracking import Tracker, TrackerConfig
+from r_one.tracking import Measurement, Tracker, TrackerConfig
 from r_one.world_model import WorldModel
+from r_one_msgs.msg import Track as TrackMsg
 
 
 def camera_info(k):
@@ -79,10 +81,14 @@ def fake_node(**overrides):
         tf_buffer=mock.Mock(),
         marker_pub=mock.Mock(),
         costmap_obstacle_pub=mock.Mock(),
+        track_pub=mock.Mock(),
         detection_3d_pub=None,
         cycle_times=[],
         last_sync_delta_ms=0.0,
         last_inference_latency=0.0,
+        finished_frames=deque(),
+        first_finished_frame=None,
+        last_range_gap_ms=0.0,
     )
     attrs.update(overrides)
     return SimpleNamespace(**attrs)
@@ -274,6 +280,64 @@ class TestFrameTracking(unittest.TestCase):
         ])
 
 
+class TestOutputsEveryFrame(unittest.TestCase):
+    def run_frame(self, node, detections, sec=1):
+        node.bridge.imgmsg_to_cv2.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+        node.detector.detect.return_value = detections
+        with mock.patch.object(
+            geometry, 'transform_point', return_value=Point(x=1.0, y=2.0, z=0.0)
+        ):
+            SpatialVisionNode.process_perception_frame(
+                node,
+                img_msg=object(),
+                stamp=Time(sec=sec, nanosec=0),
+                sensor_data=np.full((100, 100), 2.0, dtype=np.float32),
+                is_depth_image=True,
+            )
+
+    def test_an_empty_frame_publishes_empty_outputs(self):
+        node = fake_node(fx=500.0, fy=500.0, cx=50.0, cy=50.0)
+        self.run_frame(node, [])
+        cloud = node.costmap_obstacle_pub.publish.call_args.args[0]
+        self.assertEqual((cloud.width, len(cloud.data)), (0, 0))
+        self.assertEqual(cloud.header.frame_id, 'odom')
+        tracks = node.track_pub.publish.call_args.args[0]
+        self.assertEqual(tracks.tracks, [])
+        self.assertEqual((tracks.header.frame_id, tracks.header.stamp.sec), ('odom', 1))
+
+    @unittest.skipUnless(spatial_vision.VISION_MSGS_AVAILABLE, 'vision_msgs is not installed')
+    def test_an_empty_frame_publishes_empty_3d_detections(self):
+        node = fake_node(fx=500.0, fy=500.0, cx=50.0, cy=50.0, detection_3d_pub=mock.Mock())
+        self.run_frame(node, [])
+        detections = node.detection_3d_pub.publish.call_args.args[0]
+        self.assertEqual(len(detections.detections), 0)
+
+    def test_a_walker_is_published_as_one_track_with_its_size(self):
+        node = fake_node(fx=500.0, fy=500.0, cx=50.0, cy=50.0)
+        person = Detection(40.0, 20.0, 60.0, 80.0, 'person', 0.9)
+        self.run_frame(node, [person], sec=1)
+        self.run_frame(node, [person], sec=2)
+        self.assertEqual(node.track_pub.publish.call_count, 2)
+        tentative = node.track_pub.publish.call_args_list[0].args[0].tracks
+        self.assertEqual([track.state for track in tentative], [TrackMsg.STATE_TENTATIVE])
+        (track,) = node.track_pub.publish.call_args.args[0].tracks
+        self.assertEqual((track.id, track.state), (1, TrackMsg.STATE_CONFIRMED))
+        self.assertAlmostEqual(track.position.x, 1.0)
+        # 20 x 60 px at 2 m with fx = fy = 500
+        self.assertAlmostEqual(track.size.x, 0.08)
+        self.assertAlmostEqual(track.size.z, 0.24)
+        logged = node.run_log.write_frame.call_args.args[2]
+        np.testing.assert_allclose(logged[0]['size'], [0.08, 0.08, 0.24])
+
+    def test_nothing_is_published_before_the_intrinsics_arrive(self):
+        node = fake_node()
+        self.run_frame(node, [Detection(40.0, 20.0, 60.0, 80.0, 'person', 0.9)])
+        node.track_pub.publish.assert_not_called()
+        node.costmap_obstacle_pub.publish.assert_not_called()
+        node.marker_pub.publish.assert_not_called()
+        node.run_log.write_frame.assert_not_called()
+
+
 class TestDepthRanging(unittest.TestCase):
     def setUp(self):
         # A person 2 m away, seen as two legs with the 6 m background between them
@@ -419,6 +483,7 @@ class TestDepthCallback(unittest.TestCase):
             (frame['img_msg'], frame['stamp'], frame['depth_frame_id']),
             (image, 'image stamp', 'depth'),
         )
+        self.assertEqual(frame['range_stamp'], 'depth stamp')
         self.assertTrue(frame['is_depth_image'])
         np.testing.assert_allclose(frame['sensor_data'], 1.5)
 
@@ -448,6 +513,7 @@ class TestLidarCallback(unittest.TestCase):
         self.assertEqual((frame['img_msg'], frame['stamp']), (image, 'image stamp'))
         self.assertIs(frame['sensor_data'], scan)
         self.assertFalse(frame['is_depth_image'])
+        self.assertEqual(frame['range_stamp'], 'scan stamp')
 
 
 class TestLidarRanging(unittest.TestCase):
@@ -659,6 +725,89 @@ class TestSlowDetector(unittest.TestCase):
         node.diag_pub.publish.assert_called_once()
         self.assertIsNotNone(node.frame_slot.take(timeout=0.0))
         node.run_log.write_frame.assert_called_once()
+
+
+class TestDiagnostics(unittest.TestCase):
+    OLD_KEYS = (
+        'fps', 'latency_ms', 'active_tracks', 'world_model_objects', 'depth_source',
+        'speed_threshold', 'sync_delta_ms',
+    )
+
+    def diagnostics(self, node, now):
+        with mock.patch.object(spatial_vision.time, 'monotonic', return_value=now):
+            SpatialVisionNode.publish_diagnostics(node)
+        status = node.diag_pub.publish.call_args.args[0].status[0]
+        return status, {value.key: value.value for value in status.values}
+
+    def node_with_frames(self, times):
+        node = fake_node()
+        node.cycle_times = [0.03]
+        node.last_inference_latency = 30.0
+        node.finished_frames = deque(times)
+        node.first_finished_frame = times[0]
+        return node
+
+    def test_throughput_counts_frames_and_falls_to_zero(self):
+        node = self.node_with_frames([100.0 + 0.2 * index for index in range(50)])
+        status, values = self.diagnostics(node, 110.0)
+        self.assertEqual(values['throughput_hz'], '5.00')
+        self.assertEqual(status.level, spatial_vision.DiagnosticStatus.OK)
+        status, values = self.diagnostics(node, 115.1)
+        self.assertEqual(values['throughput_hz'], '0.00')
+        self.assertEqual(status.level, spatial_vision.DiagnosticStatus.WARN)
+
+    def test_a_low_rate_warns_once_the_window_is_full(self):
+        node = self.node_with_frames([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+        status, values = self.diagnostics(node, 105.5)
+        self.assertEqual(values['throughput_hz'], '1.00')
+        self.assertEqual(status.level, spatial_vision.DiagnosticStatus.WARN)
+
+        node = self.node_with_frames([100.0, 101.0])
+        status, _ = self.diagnostics(node, 101.5)
+        self.assertEqual(status.level, spatial_vision.DiagnosticStatus.OK)
+
+    def test_the_range_gap_is_measured_between_the_stamps(self):
+        node = fake_node(fx=500.0, fy=500.0, cx=50.0, cy=50.0)
+        node.bridge.imgmsg_to_cv2.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+        node.detector.detect.return_value = []
+        SpatialVisionNode.process_perception_frame(
+            node, range_stamp=Time(sec=0, nanosec=970_000_000), **depth_frame(1)
+        )
+        self.assertEqual(len(node.finished_frames), 1)
+        _, values = self.diagnostics(node, node.finished_frames[0])
+        self.assertEqual(values['rgb_range_gap_ms'], '30.00')
+
+    def test_tracks_are_counted_by_state(self):
+        node = fake_node()
+        for step in range(10):
+            t = step * 0.2
+            seen = [Measurement(0.0, t, 0.0, 'person', 0.9)]
+            if step < 2:
+                seen.append(Measurement(5.0, 5.0, 0.0, 'chair', 0.6))
+            if step == 9:
+                seen.append(Measurement(-5.0, -5.0, 0.0, 'person', 0.6))
+            node.tracker.step(t, seen)
+        _, values = self.diagnostics(node, 0.0)
+        self.assertEqual(
+            [values[key] for key in (
+                'active_tracks', 'tentative_tracks', 'confirmed_tracks', 'coasting_tracks',
+                'dynamic_tracks',
+            )],
+            ['3', '1', '1', '1', '1'],
+        )
+
+    def test_old_keys_stay_and_counters_are_reported(self):
+        node = fake_node(dropped_frames=4, tf_counts={'tf_failures': 2})
+        node.received.update(images_received=10, range_msgs_received=9)
+        _, values = self.diagnostics(node, 0.0)
+        for key in self.OLD_KEYS:
+            self.assertIn(key, values)
+        self.assertEqual(
+            [values[key] for key in (
+                'dropped_frames', 'tf_failures', 'images_received', 'range_msgs_received',
+            )],
+            ['4', '2', '10', '9'],
+        )
 
 
 if __name__ == '__main__':

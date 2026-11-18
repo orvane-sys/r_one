@@ -1,9 +1,11 @@
 """Build the ROS messages that spatial_vision publishes: costmap cloud, 3D detections, markers."""
 
 import struct
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 from geometry_msgs.msg import Point
+from r_one import tracking
+from r_one_msgs.msg import Track as TrackMsg, TrackArray
 from rclpy.duration import Duration
 from sensor_msgs.msg import PointCloud2, PointField
 from visualization_msgs.msg import Marker, MarkerArray
@@ -28,6 +30,21 @@ TRACK_MARKER_NAMESPACES = (
     'detected_objects', 'object_labels', 'velocity_vectors', 'predicted_trajectories',
 )
 WORLD_MODEL_NAMESPACE = 'world_model_memory'
+
+# Box used when an object's size is unknown, drawn from 0.25 m below its point upwards
+DEFAULT_SIZE = (0.45, 0.45, 0.50)
+DEFAULT_CENTRE_OFFSET_M = 0.25
+
+
+def box_centre_and_size(pt: Point, size: Sequence[float] = ()):
+    """
+    Return the box centre height and (x, y, z) size for an object at pt.
+
+    A measured size is centred on the point. An unknown size gets the default box.
+    """
+    if len(size) == 3:
+        return pt.z, tuple(float(value) for value in size)
+    return pt.z + DEFAULT_CENTRE_OFFSET_M, DEFAULT_SIZE
 
 
 def build_pointcloud2(
@@ -66,7 +83,9 @@ def append_detection_3d(
     score: float,
     pt: Point,
     stamp,
+    size: Sequence[float] = (),
 ):
+    centre_z, (size_x, size_y, size_z) = box_centre_and_size(pt, size)
     det = Detection3D()
     det.header.frame_id = frame_id
     det.header.stamp = stamp
@@ -77,17 +96,17 @@ def append_detection_3d(
     hyp.hypothesis.score = score
     hyp.pose.pose.position.x = pt.x
     hyp.pose.pose.position.y = pt.y
-    hyp.pose.pose.position.z = pt.z + 0.25
+    hyp.pose.pose.position.z = centre_z
     hyp.pose.pose.orientation.w = 1.0
     det.results.append(hyp)
 
     det.bbox.center.position.x = pt.x
     det.bbox.center.position.y = pt.y
-    det.bbox.center.position.z = pt.z + 0.25
+    det.bbox.center.position.z = centre_z
     det.bbox.center.orientation.w = 1.0
-    det.bbox.size.x = 0.45
-    det.bbox.size.y = 0.45
-    det.bbox.size.z = 0.50
+    det.bbox.size.x = size_x
+    det.bbox.size.y = size_y
+    det.bbox.size.z = size_z
 
     detection_array.detections.append(det)
 
@@ -104,8 +123,10 @@ def append_markers(
     vel_x: float,
     vel_y: float,
     stamp,
+    size: Sequence[float] = (),
 ):
     base_id = base_marker_id
+    centre_z, (size_x, size_y, size_z) = box_centre_and_size(pt, size)
 
     cube = Marker()
     cube.header.frame_id = frame_id
@@ -116,11 +137,11 @@ def append_markers(
     cube.action = Marker.ADD
     cube.pose.position.x = pt.x
     cube.pose.position.y = pt.y
-    cube.pose.position.z = pt.z + 0.25
+    cube.pose.position.z = centre_z
     cube.pose.orientation.w = 1.0
-    cube.scale.x = 0.45
-    cube.scale.y = 0.45
-    cube.scale.z = 0.50
+    cube.scale.x = size_x
+    cube.scale.y = size_y
+    cube.scale.z = size_z
     cube.lifetime = Duration(seconds=0.6).to_msg()
 
     if state == 'DYNAMIC':
@@ -144,7 +165,8 @@ def append_markers(
     text.action = Marker.ADD
     text.pose.position.x = pt.x
     text.pose.position.y = pt.y
-    text.pose.position.z = pt.z + 0.65
+    # Just above the box
+    text.pose.position.z = centre_z + size_z / 2.0 + 0.15
     text.scale.z = 0.18
     text.color.r = 1.0
     text.color.g = 1.0
@@ -247,3 +269,46 @@ def append_delete_markers(
         marker.id = marker_id
         marker.action = Marker.DELETE
         marker_array.markers.append(marker)
+
+
+_STATES = {
+    tracking.TENTATIVE: TrackMsg.STATE_TENTATIVE,
+    tracking.CONFIRMED: TrackMsg.STATE_CONFIRMED,
+    tracking.COASTING: TrackMsg.STATE_COASTING,
+}
+_MOTIONS = {
+    tracking.UNKNOWN: TrackMsg.MOTION_UNKNOWN,
+    tracking.STATIC: TrackMsg.MOTION_STATIC,
+    tracking.DYNAMIC: TrackMsg.MOTION_DYNAMIC,
+}
+
+
+def build_track_array(
+    tracker: 'tracking.Tracker',
+    tracks: Iterable['tracking.Track'],
+    frame_id: str,
+    stamp,
+    time: float,
+) -> TrackArray:
+    """Describe the given tracks, with the tracker's lifecycle state, as a TrackArray."""
+    array = TrackArray()
+    array.header.frame_id = frame_id
+    array.header.stamp = stamp
+    for track in tracks:
+        msg = TrackMsg()
+        msg.id = int(track.id)
+        msg.class_name = str(track.class_name)
+        msg.score = float(track.measurement.score)
+        msg.state = _STATES[tracker.lifecycle(track)]
+        msg.motion = _MOTIONS[track.motion]
+        x, y, z = track.position
+        msg.position.x, msg.position.y, msg.position.z = x, y, z
+        msg.velocity.x, msg.velocity.y = track.velocity
+        if len(track.measurement.size) == 3:
+            size_x, size_y, size_z = (float(value) for value in track.measurement.size)
+            msg.size.x, msg.size.y, msg.size.z = size_x, size_y, size_z
+        msg.covariance = [float(value) for value in track.filter.P.flatten()]
+        msg.age_s = float(time - track.created)
+        msg.time_since_update_s = float(time - track.last_update)
+        array.tracks.append(msg)
+    return array

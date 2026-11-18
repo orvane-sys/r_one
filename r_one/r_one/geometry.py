@@ -77,6 +77,29 @@ def points_in_box(
     return points[inside]
 
 
+def measured_size(
+    box: Tuple[float, ...],
+    range_m: float,
+    fx: float,
+    fy: float,
+) -> Tuple[float, ...]:
+    """
+    Return an object's (width, depth, height) in metres from its pixel box and range.
+
+    The camera cannot see an object's depth, so depth is assumed equal to its width.
+    Returns () when the box or the range is not positive and finite.
+    """
+    if len(box) != 4:
+        return ()
+    x1, y1, x2, y2 = box
+    values = (x2 - x1, y2 - y1, range_m, fx, fy)
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        return ()
+    width = float((x2 - x1) * range_m / fx)
+    height = float((y2 - y1) * range_m / fy)
+    return (width, width, height)
+
+
 def nearest_cluster(
     points: np.ndarray,
     gap_m: float = CLUSTER_GAP_M,
