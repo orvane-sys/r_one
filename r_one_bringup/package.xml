@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>r_one_bringup</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>Launch files, configuration, robot description and simulation worlds for r_one</description>
   <maintainer email="dev@orvane-sys.com">Orvane Systems</maintainer>
   <license>Apache-2.0</license>
