@@ -1,6 +1,6 @@
 """r_one: ROS 2 Spatial Perception and 3D Scene Understanding package."""
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 
 # Lazy module access or explicit subpackage imports
